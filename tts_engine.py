@@ -1,4 +1,4 @@
-"""Holly AI Assistant — Text-to-speech engine.
+"""Eigy AI Assistant — Text-to-speech engine.
 
 OpenAI TTS HD primary, edge-tts fallback.
 Includes sentence buffer for streaming TTS pipeline.
@@ -20,7 +20,7 @@ import config
 logger = logging.getLogger(__name__)
 
 # Temp directory for TTS audio files
-TTS_TEMP_DIR = Path(tempfile.gettempdir()) / "holly_tts"
+TTS_TEMP_DIR = Path(tempfile.gettempdir()) / "eigy_tts"
 TTS_TEMP_DIR.mkdir(exist_ok=True)
 
 
@@ -118,7 +118,7 @@ class TTSEngine:
 
     async def _openai_tts(self, text: str) -> str:
         """Generate speech via OpenAI TTS HD API."""
-        filepath = TTS_TEMP_DIR / f"holly_{int(time.time() * 1000)}.mp3"
+        filepath = TTS_TEMP_DIR / f"eigy_{int(time.time() * 1000)}.mp3"
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -143,7 +143,7 @@ class TTSEngine:
         """Generate speech via edge-tts (free Microsoft Azure neural voices)."""
         import edge_tts
 
-        filepath = TTS_TEMP_DIR / f"holly_{int(time.time() * 1000)}.mp3"
+        filepath = TTS_TEMP_DIR / f"eigy_{int(time.time() * 1000)}.mp3"
 
         # Map OpenAI voice names to edge-tts voices
         edge_voice = self.voice

@@ -1,4 +1,4 @@
-"""Holly AI Assistant — LLM communication engine.
+"""Eigy AI Assistant — LLM communication engine.
 
 Anthropic API (primary) with OpenRouter fallback.
 Streaming responses via SSE.
@@ -86,7 +86,7 @@ async def stream_openrouter(
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/holly-ai",
+                "HTTP-Referer": "https://github.com/eigy-ai",
             },
             json={
                 "model": model,
@@ -167,7 +167,7 @@ async def get_auxiliary_response(
             headers={
                 "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/holly-ai",
+                "HTTP-Referer": "https://github.com/eigy-ai",
             },
             json={
                 "model": model,

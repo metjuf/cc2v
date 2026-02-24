@@ -1,7 +1,8 @@
-"""Holly AI Assistant — Memory manager.
+"""Eigy AI Assistant — Memory manager.
 
 Builds optimal context windows with history, profile, and summaries.
 Handles session lifecycle (save messages, end-of-session summaries).
+Supports real-time fact extraction during conversation.
 """
 
 from __future__ import annotations
@@ -37,9 +38,23 @@ Existující profil: {current_profile}
 Vrať POUZE validní JSON, žádný jiný text.\
 """
 
+REALTIME_EXTRACTION_PROMPT = """\
+Z této výměny zpráv extrahuj NOVÉ osobní informace o uživateli.
+Zaměř se na: zájmy, rodinu, práci, co vlastní, kde bydlí, preference, návyky.
+
+Existující profil: {current_profile}
+
+Uživatel: {user_msg}
+Asistent: {assistant_msg}
+
+Vrať POUZE validní JSON (žádný jiný text):
+{{"interests": [...], "preferences": [...], "facts": {{"klíč": "hodnota"}}}}
+Pokud nic nového, vrať: {{}}\
+"""
+
 
 class MemoryManager:
-    """Manages Holly's memory — context building, message persistence, session lifecycle."""
+    """Manages memory — context building, message persistence, session lifecycle."""
 
     def __init__(self, db: Database):
         self.db = db
@@ -49,7 +64,10 @@ class MemoryManager:
 
     @property
     def system_prompt(self) -> str:
-        return config.SYSTEM_PROMPT_TEMPLATE.format(user_name=self.user_name)
+        return config.SYSTEM_PROMPT_TEMPLATE.format(
+            user_name=self.user_name,
+            assistant_name=config.ASSISTANT_NAME,
+        )
 
     def build_context(self, current_messages: list[dict]) -> list[dict]:
         """Build the full messages array for the LLM with relevant history.
@@ -104,6 +122,49 @@ class MemoryManager:
     def save_message(self, role: str, content: str, emotion: str | None = None) -> None:
         """Persist a message to the database."""
         self.db.insert_message(self.session_id, role, content, emotion)
+
+    async def extract_facts_realtime(self, user_msg: str, assistant_msg: str) -> None:
+        """Extract facts from a single exchange in real-time (background task).
+
+        Only runs if user message is substantial enough (>20 chars).
+        Uses the auxiliary model for cheap, fast extraction.
+        """
+        if len(user_msg.strip()) < 20:
+            return
+
+        try:
+            current_profile = json.dumps(self.db.get_all_profile(), ensure_ascii=False)
+            prompt = REALTIME_EXTRACTION_PROMPT.format(
+                current_profile=current_profile,
+                user_msg=user_msg,
+                assistant_msg=assistant_msg[:500],  # truncate for cost
+            )
+            prompt_messages = [{"role": "user", "content": prompt}]
+            response = await chat_engine.get_auxiliary_response(prompt_messages)
+            if not response:
+                return
+
+            response = response.strip()
+            if response.startswith("```"):
+                lines = response.split("\n")
+                response = "\n".join(lines[1:-1])
+
+            data = json.loads(response)
+
+            # Only update if there's actual data
+            has_data = (
+                data.get("interests")
+                or data.get("preferences")
+                or data.get("facts")
+            )
+            if has_data:
+                self.profile.update_from_extraction(data)
+                logger.info("Real-time extraction found new facts: %s", list(data.keys()))
+
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.debug("Real-time extraction parse error: %s", e)
+        except Exception as e:
+            logger.debug("Real-time extraction failed: %s", e)
 
     async def end_session(self) -> None:
         """Called on exit — generate summary, extract profile updates."""

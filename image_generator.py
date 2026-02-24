@@ -1,4 +1,4 @@
-"""Holly AI Assistant — Face image generation via DALL-E 3.
+"""Eigy AI Assistant — Face image generation via DALL-E 3.
 
 Generates photorealistic portraits and saves them to assets/generated/.
 """

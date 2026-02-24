@@ -1,4 +1,4 @@
-"""Holly AI Assistant — SQLite database layer.
+"""Eigy AI Assistant — SQLite database layer.
 
 Schema creation and all CRUD operations for conversations,
 messages, and user profile.
@@ -11,8 +11,13 @@ from datetime import datetime
 from pathlib import Path
 
 
+def _now() -> str:
+    """Return current timestamp as ISO string (avoids Python 3.12+ sqlite3 warning)."""
+    return datetime.now().isoformat()
+
+
 class Database:
-    """SQLite database for Holly's persistent memory."""
+    """SQLite database for Eigy's persistent memory."""
 
     SCHEMA_VERSION = 1
 
@@ -82,7 +87,7 @@ class Database:
             """INSERT INTO user_profile (key, value, updated_at)
                VALUES (?, ?, ?)
                ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?""",
-            (key, value, datetime.now(), value, datetime.now()),
+            (key, value, _now(), value, _now()),
         )
         self.conn.commit()
 
@@ -114,7 +119,7 @@ class Database:
     def create_conversation(self) -> int:
         cursor = self.conn.execute(
             "INSERT INTO conversations (started_at) VALUES (?)",
-            (datetime.now(),),
+            (_now(),),
         )
         self.conn.commit()
         return cursor.lastrowid
@@ -122,7 +127,7 @@ class Database:
     def end_conversation(self, conv_id: int) -> None:
         self.conn.execute(
             "UPDATE conversations SET ended_at = ? WHERE id = ?",
-            (datetime.now(), conv_id),
+            (_now(), conv_id),
         )
         self.conn.commit()
 
@@ -141,7 +146,7 @@ class Database:
         self.conn.execute(
             """INSERT INTO messages (conversation_id, role, content, timestamp, emotion)
                VALUES (?, ?, ?, ?, ?)""",
-            (conv_id, role, content, datetime.now(), emotion),
+            (conv_id, role, content, _now(), emotion),
         )
         self.conn.commit()
 

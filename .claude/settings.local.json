@@ -54,7 +54,17 @@
       "Bash(xxd -l 16 /Users/metjuf/Documents/GitHub/cc2v/assets/models/holly_avatar_attempt2.glb)",
       "Bash(python3 -c \":*)",
       "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/python -c \"import sys; print\\(sys.prefix\\)\")",
-      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/pip show panda3d)"
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/pip show panda3d)",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/python -c \"from duckduckgo_search import AsyncDDGS; print\\(''OK''\\)\")",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/python -c \"import duckduckgo_search; print\\(dir\\(duckduckgo_search\\)\\); print\\(duckduckgo_search.__version__\\)\")",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/python -c \"from web_search import detect_search_request, search, format_results; print\\(''Import OK''\\)\")",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/python -c \"from duckduckgo_search import DDGS; print\\(''OK''\\)\")",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/pip list)",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/pip install duckduckgo-search)",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/pip install ddgs)",
+      "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/python -c \"import ddgs; help\\(ddgs.DDGS.text\\)\")",
+      "Bash(/Users/metjuf/VS_projects/cc2v/venv/bin/python -c \"import ddgs; print\\(dir\\(ddgs\\)\\)\")",
+      "Bash(/Users/metjuf/VS_projects/cc2v/venv/bin/python -c \":*)"
     ]
   }
 }

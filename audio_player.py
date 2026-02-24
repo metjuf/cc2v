@@ -1,4 +1,4 @@
-"""Holly AI Assistant — Audio playback with amplitude extraction.
+"""Eigy AI Assistant — Audio playback with amplitude extraction.
 
 Queue-based playback via pygame.mixer with RMS amplitude
 extraction for lip sync animation.

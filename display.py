@@ -1,4 +1,4 @@
-"""Holly AI Assistant — Terminal display module.
+"""Eigy AI Assistant — Terminal display module.
 
 Rich-formatted output and prompt_toolkit input.
 """
@@ -16,6 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import config
 
 console = Console()
 
@@ -33,15 +34,17 @@ def _get_prompt_session() -> PromptSession:
 
 # ── Output ─────────────────────────────────────────────────────────
 
+_NAME = config.ASSISTANT_NAME
+
 
 def show_welcome_banner() -> None:
-    """Display the Holly welcome panel on first launch."""
+    """Display the welcome panel on first launch."""
     panel = Panel(
         Text.from_markup(
-            "[bold cyan]Tak jo. Jsem Holly, lodní počítač.\n"
-            "IQ 6000. Plus mínus.[/bold cyan]"
+            f"[bold cyan]{_NAME} — osobní AI asistentka.\n"
+            "K vašim službám.[/bold cyan]"
         ),
-        title="[bold white]Holly — AI Asistentka[/bold white]",
+        title=f"[bold white]{_NAME}[/bold white]",
         border_style="cyan",
         padding=(1, 2),
     )
@@ -49,11 +52,15 @@ def show_welcome_banner() -> None:
     console.print()
 
 
-def show_holly(text: str) -> None:
-    """Display a Holly message (non-streaming)."""
-    console.print(Text("Holly > ", style="bold cyan"), end="")
+def show_assistant(text: str) -> None:
+    """Display an assistant message (non-streaming)."""
+    console.print(Text(f"{_NAME} > ", style="bold cyan"), end="")
     console.print(Markdown(text))
     console.print()
+
+
+# Keep old name as alias for compatibility during transition
+show_holly = show_assistant
 
 
 def show_user(text: str) -> None:
@@ -78,13 +85,13 @@ def show_error(text: str) -> None:
 
 
 class StreamingDisplay:
-    """Manages streaming token-by-token display of Holly's response."""
+    """Manages streaming token-by-token display of assistant's response."""
 
     def __init__(self):
         self._started = False
 
     def start(self) -> None:
-        console.print(Text("Holly > ", style="bold cyan"), end="")
+        console.print(Text(f"{_NAME} > ", style="bold cyan"), end="")
         self._started = True
 
     def token(self, text: str) -> None:
@@ -104,7 +111,7 @@ class StreamingDisplay:
 
 def show_thinking() -> None:
     """Show a thinking indicator."""
-    console.print(Text("  Holly přemýšlí...", style="dim cyan"))
+    console.print(Text(f"  {_NAME} přemýšlí...", style="dim cyan"))
 
 
 # ── Input ──────────────────────────────────────────────────────────
@@ -134,7 +141,7 @@ async def get_user_input() -> str | None:
 
 def show_help() -> None:
     """Show available commands."""
-    table = Table(title="Holly — Příkazy", border_style="cyan")
+    table = Table(title=f"{_NAME} — Příkazy", border_style="cyan")
     table.add_column("Příkaz", style="bold cyan")
     table.add_column("Popis", style="white")
 
@@ -145,8 +152,11 @@ def show_help() -> None:
         ("/voice [jméno]", "Přepnout TTS hlas"),
         ("/volume [0-100]", "Nastavit hlasitost"),
         ("/model [název]", "Přepnout primární chat model"),
-        ("/memory", "Ukázat, co si Holly pamatuje"),
+        ("/memory", "Ukázat, co si pamatuji"),
         ("/forget", "Smazat všechny vzpomínky (s potvrzením)"),
+        ("/timer", "Zobrazit aktivní timery"),
+        ("/timer cancel [id]", "Zrušit timer"),
+        ("\"vyhledej X\"", "Automatický web search (DuckDuckGo)"),
         ("/history", "Zobrazit historii aktuální relace"),
         ("/export", "Exportovat vše do JSON"),
         ("/help", "Zobrazit tuto nápovědu"),

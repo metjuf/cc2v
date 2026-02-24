@@ -1,4 +1,4 @@
-"""Holly AI Assistant — User profile management.
+"""Eigy AI Assistant — User profile management.
 
 Higher-level operations for user profile data stored in SQLite.
 """

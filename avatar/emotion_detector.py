@@ -1,6 +1,6 @@
-"""Holly AI Assistant — Emotion detection from text.
+"""Eigy AI Assistant — Emotion detection from text.
 
-Analyzes Holly's response text to determine the appropriate
+Analyzes assistant's response text to determine the appropriate
 avatar emotion state. Keyword-based (fast) with optional LLM fallback.
 """
 
@@ -14,7 +14,7 @@ import config
 logger = logging.getLogger(__name__)
 
 # Emotion keyword patterns — scored by specificity
-# Czech + English patterns (Holly speaks Czech but may use some English terms)
+# Czech + English patterns (Eigy speaks Czech but may use some English terms)
 _PATTERNS: dict[str, list[str]] = {
     "amused": [
         # Czech
@@ -65,7 +65,7 @@ _PATTERNS: dict[str, list[str]] = {
 
 
 def detect_emotion(text: str) -> str:
-    """Detect emotion from Holly's response text using keyword matching.
+    """Detect emotion from assistant's response text using keyword matching.
 
     Returns one of: neutral, amused, happy, concerned, surprised, thinking.
     """

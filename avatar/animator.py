@@ -1,4 +1,4 @@
-"""Holly AI Assistant — 2D Animation system.
+"""Eigy AI Assistant — 2D Animation system.
 
 Manages all avatar animations with discrete layer outputs:
 blinking, breathing, eye drift, micro-expressions, lip sync,
@@ -135,6 +135,11 @@ class Animator:
             "eyebrows": eyebrows,
             "x_offset": x_offset,
             "y_offset": y_offset,
+            # Visual effects data
+            "emotion": self._emotion,
+            "state": self.state,
+            "breath_phase": (self.time % self._breath_period) / self._breath_period,
+            "amplitude": self._mouth_amplitude,
         }
 
     # ── Private: animation updates ──────────────────────────────

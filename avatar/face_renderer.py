@@ -1,7 +1,8 @@
-"""Holly AI Assistant — Layered PNG face renderer.
+"""Eigy AI Assistant — Layered PNG face renderer.
 
 Loads transparent PNG layers from a face directory and composites
-them onto a Pygame surface in the correct order.
+them onto a Pygame surface with alpha blending support for
+smooth transitions between states.
 """
 
 from __future__ import annotations
@@ -33,10 +34,9 @@ class FaceRenderer:
             return
 
         for png_file in sorted(self.face_dir.glob("*.png")):
-            name = png_file.stem  # e.g., "eyes_open", "mouth_smile"
+            name = png_file.stem
             try:
                 surface = pygame.image.load(str(png_file)).convert_alpha()
-                # Scale to fit window while preserving aspect ratio
                 surface = self._scale_to_window(surface)
                 self.layers[name] = surface
             except Exception as e:
@@ -54,45 +54,84 @@ class FaceRenderer:
         new_h = int(sh * scale)
         return pygame.transform.smoothscale(surface, (new_w, new_h))
 
+    def _blit_layer(
+        self,
+        target: pygame.Surface,
+        name: str,
+        x_offset: float,
+        y_offset: float,
+        alpha: int = 255,
+    ) -> None:
+        """Blit a named layer with optional alpha onto target."""
+        surface = self.layers.get(name)
+        if surface is None:
+            return
+        ww, wh = self.window_size
+        sw, sh = surface.get_size()
+        x = (ww - sw) // 2 + int(x_offset)
+        y = (wh - sh) // 2 + int(y_offset)
+
+        if alpha >= 255:
+            target.blit(surface, (x, y))
+        else:
+            tmp = surface.copy()
+            tmp.set_alpha(alpha)
+            target.blit(tmp, (x, y))
+
     def render(
         self,
         target: pygame.Surface,
-        eyes: str = "open",
-        mouth: str = "closed",
-        eyebrows: str = "neutral",
-        x_offset: float = 0.0,
-        y_offset: float = 0.0,
+        state: dict,
     ) -> None:
         """Render composited face onto target surface.
 
-        Args:
-            target: Pygame surface to draw on.
-            eyes: One of "open", "half", "closed".
-            mouth: One of "closed", "open_1", "open_2", "open_3",
-                   "smile", "sad", "surprised", "smirk".
-            eyebrows: One of "neutral", "raised", "frown".
-            x_offset: Horizontal offset in pixels (for eye drift).
-            y_offset: Vertical offset in pixels (for breathing).
+        state dict keys:
+            eyes: str — layer name suffix ("open", "half", "closed")
+            eyes_blend: float — 0.0 = primary, 1.0 = fully secondary layer
+            eyes_secondary: str — second eye layer to blend toward
+            mouth: str — primary mouth layer suffix
+            mouth_blend: float — blend toward mouth_secondary
+            mouth_secondary: str — second mouth layer to blend toward
+            eyebrows: str — layer name suffix
+            x_offset, y_offset: float — pixel offsets
         """
-        ww, wh = self.window_size
+        xo = state.get("x_offset", 0.0)
+        yo = state.get("y_offset", 0.0)
 
-        layer_names = {
-            "base": "base",
-            "eyes": f"eyes_{eyes}",
-            "eyebrows": f"eyebrows_{eyebrows}",
-            "mouth": f"mouth_{mouth}",
-        }
+        # 1. Base (always full alpha)
+        self._blit_layer(target, "base", xo, yo)
 
-        for layer_key in LAYER_ORDER:
-            name = layer_names.get(layer_key, "")
-            surface = self.layers.get(name)
-            if surface is None:
-                continue
+        # 2. Eyes — crossfade between two layers
+        eyes_primary = f"eyes_{state.get('eyes', 'open')}"
+        eyes_blend = state.get("eyes_blend", 0.0)
+        eyes_secondary = state.get("eyes_secondary")
 
-            sw, sh = surface.get_size()
-            x = (ww - sw) // 2 + int(x_offset)
-            y = (wh - sh) // 2 + int(y_offset)
-            target.blit(surface, (x, y))
+        if eyes_blend > 0.01 and eyes_secondary:
+            sec_name = f"eyes_{eyes_secondary}"
+            primary_alpha = int(255 * (1.0 - eyes_blend))
+            secondary_alpha = int(255 * eyes_blend)
+            self._blit_layer(target, eyes_primary, xo, yo, primary_alpha)
+            self._blit_layer(target, sec_name, xo, yo, secondary_alpha)
+        else:
+            self._blit_layer(target, eyes_primary, xo, yo)
+
+        # 3. Eyebrows
+        eyebrows = f"eyebrows_{state.get('eyebrows', 'neutral')}"
+        self._blit_layer(target, eyebrows, xo, yo)
+
+        # 4. Mouth — crossfade between two layers
+        mouth_primary = f"mouth_{state.get('mouth', 'closed')}"
+        mouth_blend = state.get("mouth_blend", 0.0)
+        mouth_secondary = state.get("mouth_secondary")
+
+        if mouth_blend > 0.01 and mouth_secondary:
+            sec_name = f"mouth_{mouth_secondary}"
+            primary_alpha = int(255 * (1.0 - mouth_blend))
+            secondary_alpha = int(255 * mouth_blend)
+            self._blit_layer(target, mouth_primary, xo, yo, primary_alpha)
+            self._blit_layer(target, sec_name, xo, yo, secondary_alpha)
+        else:
+            self._blit_layer(target, mouth_primary, xo, yo)
 
     @property
     def available_layers(self) -> list[str]:
