@@ -59,9 +59,6 @@ def show_assistant(text: str) -> None:
     console.print()
 
 
-# Keep old name as alias for compatibility during transition
-show_holly = show_assistant
-
 
 def show_user(text: str) -> None:
     """Display a user message."""
@@ -124,7 +121,7 @@ async def get_user_input() -> str | None:
     """
     session = _get_prompt_session()
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(
             None,
             partial(session.prompt, HTML("<ansigreen><b>Ty &gt; </b></ansigreen>")),
@@ -146,20 +143,28 @@ def show_help() -> None:
     table.add_column("Popis", style="white")
 
     commands = [
-        ("/avatar", "Přepnout okno avatara"),
-        ("/emotion [emoce]", "Ručně nastavit emoci avatara (testování)"),
         ("/voice on/off", "Zapnout/vypnout hlas"),
         ("/voice [jméno]", "Přepnout TTS hlas"),
         ("/volume [0-100]", "Nastavit hlasitost"),
+        ("/avatar", "Přepnout okno avatara"),
+        ("/emotion [emoce]", "Ručně nastavit emoci avatara"),
         ("/model [název]", "Přepnout primární chat model"),
         ("/memory", "Ukázat, co si pamatuji"),
         ("/forget", "Smazat všechny vzpomínky (s potvrzením)"),
         ("/timer", "Zobrazit aktivní timery"),
         ("/timer cancel [id]", "Zrušit timer"),
-        ("\"vyhledej X\"", "Automatický web search (DuckDuckGo)"),
         ("/history", "Zobrazit historii aktuální relace"),
         ("/export", "Exportovat vše do JSON"),
         ("/help", "Zobrazit tuto nápovědu"),
+        ("", ""),
+        ("zobraz imessage [N]", "Zobrazit příchozí iMessage zprávy"),
+        ("odepiš na imessage X", "Odpovědět na iMessage zprávu"),
+        ("ulož kontakt X Jméno", "Uložit iMessage kontakt"),
+        ("kontakty", "Zobrazit uložené kontakty"),
+        ("", ""),
+        ("\"vyhledej X\"", "Automatický web search (DuckDuckGo)"),
+        ("\"cena bitcoinu\"", "Živá cena kryptoměny (CoinGecko)"),
+        ("\"stopni mi 10 minut\"", "Nastavit odpočet/timer"),
         ("exit / quit / konec", "Ukončit (automaticky uloží relaci)"),
     ]
     for cmd, desc in commands:

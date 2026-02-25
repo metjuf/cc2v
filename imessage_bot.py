@@ -23,10 +23,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(levelname)s %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────
@@ -667,4 +663,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     main()

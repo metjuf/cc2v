@@ -56,9 +56,9 @@ async def stream_anthropic(
             timeout=60.0,
         ) as response:
             if response.status_code != 200:
-                error_body = await response.aread()
+                body = (await response.aread()).decode(errors="replace")
                 raise httpx.HTTPStatusError(
-                    f"Anthropic API error: {response.status_code}",
+                    f"Anthropic API error {response.status_code}: {body[:200]}",
                     request=response.request,
                     response=response,
                 )
@@ -96,9 +96,9 @@ async def stream_openrouter(
             timeout=60.0,
         ) as response:
             if response.status_code != 200:
-                error_body = await response.aread()
+                body = (await response.aread()).decode(errors="replace")
                 raise httpx.HTTPStatusError(
-                    f"OpenRouter API error: {response.status_code}",
+                    f"OpenRouter API error {response.status_code}: {body[:200]}",
                     request=response.request,
                     response=response,
                 )

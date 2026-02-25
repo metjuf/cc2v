@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 from datetime import date
+from urllib.parse import urlparse
 
 import httpx
 from lxml import html as lxml_html
@@ -370,7 +371,7 @@ async def search(query: str, max_results: int = 7) -> list[dict]:
     Returns list of {"title", "url", "snippet", "content"(optional)}.
     """
     enhanced_query = _enhance_query(query)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(None, _search_sync, enhanced_query, max_results)
     if results:
         results = await _enrich_results(results)
@@ -388,7 +389,6 @@ def _short_source(url: str) -> str:
         https://www.itmix.cz/novinky/...     → itmix.cz
     """
     try:
-        from urllib.parse import urlparse
         host = urlparse(url).hostname or ""
         # Strip leading "www."
         if host.startswith("www."):
