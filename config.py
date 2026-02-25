@@ -16,17 +16,14 @@ load_dotenv(PROJECT_ROOT / ".env")
 DATA_DIR = PROJECT_ROOT / os.getenv("DATABASE_PATH", "data/eigy.db").rsplit("/", 1)[0]
 ASSETS_DIR = PROJECT_ROOT / "assets"
 DEFAULT_FACE_DIR = ASSETS_DIR / "default_face"
-GENERATED_FACE_DIR = ASSETS_DIR / "generated"
 
 # Auto-create required directories
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-GENERATED_FACE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── API Keys ───────────────────────────────────────────────────────
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # ── Models ─────────────────────────────────────────────────────────
 
@@ -36,7 +33,6 @@ AUX_MODEL = os.getenv("AUX_MODEL", "meta-llama/llama-3.1-8b-instruct")
 
 # ── TTS ────────────────────────────────────────────────────────────
 
-TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge")
 TTS_VOICE = os.getenv("TTS_VOICE", "cs-CZ-VlastaNeural")
 TTS_ENABLED = os.getenv("TTS_ENABLED", "true").lower() == "true"
 
@@ -99,10 +95,5 @@ def validate_config() -> list[str]:
     if not ANTHROPIC_API_KEY and not OPENROUTER_API_KEY:
         warnings.append(
             "No LLM API key configured. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY in .env"
-        )
-    if not OPENAI_API_KEY:
-        warnings.append(
-            "OPENAI_API_KEY not set — face generation and premium TTS unavailable, "
-            "using edge-tts fallback"
         )
     return warnings

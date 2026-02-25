@@ -16,7 +16,6 @@ import threading
 import config
 import chat_engine
 import display
-import image_generator
 from avatar.emotion_detector import detect_emotion, detect_emotion_llm
 from memory.database import Database
 from memory.memory_manager import MemoryManager
@@ -762,8 +761,15 @@ async def chat_loop(
                 stream_display = display.StreamingDisplay()
                 sentence_buffer = SentenceBuffer()
                 full_response: list[str] = []
-                tts_tasks: list[asyncio.Task] = []
                 first_token = True
+
+                # Sequential TTS worker — synthesizes sentences in order
+                tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+                tts_worker: asyncio.Task | None = None
+                if tts.enabled:
+                    tts_worker = asyncio.create_task(
+                        _tts_sequential_worker(tts_queue, tts, audio_player)
+                    )
 
                 try:
                     stream_display.start()
@@ -781,14 +787,11 @@ async def chat_loop(
                         stream_display.token(token)
                         full_response.append(token)
 
-                        # Sentence-level TTS
+                        # Sentence-level TTS (in-order via queue)
                         if tts.enabled:
                             sentences = sentence_buffer.add_token(token)
                             for sentence in sentences:
-                                task = asyncio.create_task(
-                                    _synthesize_and_enqueue(sentence, tts, audio_player)
-                                )
-                                tts_tasks.append(task)
+                                await tts_queue.put(sentence)
 
                     stream_display.end()
                     avatar_queue.put({"type": "speaking_end"})
@@ -797,18 +800,18 @@ async def chat_loop(
                     if tts.enabled:
                         remaining = sentence_buffer.flush()
                         if remaining:
-                            task = asyncio.create_task(
-                                _synthesize_and_enqueue(remaining, tts, audio_player)
-                            )
-                            tts_tasks.append(task)
-
-                    # Wait for all TTS tasks
-                    if tts_tasks:
-                        await asyncio.gather(*tts_tasks, return_exceptions=True)
+                            await tts_queue.put(remaining)
+                        # Signal worker to stop and wait for it
+                        await tts_queue.put(None)
+                        if tts_worker:
+                            await tts_worker
 
                 except Exception as e:
                     stream_display.end()
                     avatar_queue.put({"type": "thinking_end"})
+                    if tts_worker and not tts_worker.done():
+                        await tts_queue.put(None)
+                        await tts_worker
                     display.show_error(f"Odpověď selhala: {e}")
                     current_messages.pop()
                     continue
@@ -892,13 +895,24 @@ async def _speak(
             audio_player.enqueue(path)
 
 
-async def _synthesize_and_enqueue(
-    text: str, tts: TTSEngine, audio_player: AudioPlayer
+async def _tts_sequential_worker(
+    sentence_queue: asyncio.Queue,
+    tts: TTSEngine,
+    audio_player: AudioPlayer,
 ) -> None:
-    """Helper: synthesize text and add to audio queue."""
-    path = await tts.synthesize(text)
-    if path:
-        audio_player.enqueue(path)
+    """Sequential TTS worker — synthesizes sentences in order.
+
+    Reads sentences from the queue one by one and enqueues audio
+    in the same order, preventing out-of-order playback.
+    Stops when it receives None as sentinel.
+    """
+    while True:
+        sentence = await sentence_queue.get()
+        if sentence is None:
+            break
+        path = await tts.synthesize(sentence)
+        if path:
+            audio_player.enqueue(path)
 
 
 # ── Entry point ────────────────────────────────────────────────────

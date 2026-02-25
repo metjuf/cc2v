@@ -30,7 +30,7 @@ Projdi tento rozhovor a extrahuj nové informace o uživateli.
 Vrať validní JSON s těmito klíči (uveď pouze pokud je nová informace):
 - "interests": seznam zájmů zmíněných v rozhovoru (řetězce)
 - "preferences": seznam preferencí vyjádřených uživatelem (řetězce)
-- "facts": objekt {"klíč": "popis"} pro zajímavé fakty (práce, bydliště, mazlíčci atd.)
+- "facts": objekt {{"klíč": "popis"}} pro zajímavé fakty (práce, bydliště, mazlíčci atd.)
 
 Uveď POUZE NOVÉ informace, které ještě nejsou v existujícím profilu.
 Existující profil: {current_profile}
