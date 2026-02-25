@@ -1,14 +1,17 @@
 """Eigy AI Assistant — SQLite database layer.
 
 Schema creation and all CRUD operations for conversations,
-messages, and user profile.
+messages, user profile, and assistant profiles.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -19,7 +22,7 @@ def _now() -> str:
 class Database:
     """SQLite database for Eigy's persistent memory."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -28,6 +31,7 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
+        self._migrate()
 
     def _create_tables(self) -> None:
         cursor = self.conn.cursor()
@@ -55,7 +59,16 @@ class Database:
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                emotion TEXT
+                emotion TEXT,
+                assistant_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS assistant_profile (
+                assistant_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (assistant_id, key)
             );
         """)
         # Set schema version if not present
@@ -66,6 +79,37 @@ class Database:
                 (self.SCHEMA_VERSION,),
             )
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Run schema migrations from current version to SCHEMA_VERSION."""
+        cursor = self.conn.cursor()
+        row = cursor.execute("SELECT version FROM schema_version").fetchone()
+        current = row["version"] if row else 1
+
+        if current < 2:
+            logger.info("Migrating database schema v%d -> v2", current)
+            # Add assistant_id column to messages (nullable for old rows)
+            try:
+                cursor.execute("ALTER TABLE messages ADD COLUMN assistant_id TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+            # Create assistant_profile table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS assistant_profile (
+                    assistant_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (assistant_id, key)
+                )
+            """)
+
+            cursor.execute(
+                "UPDATE schema_version SET version = ?", (2,)
+            )
+            self.conn.commit()
+            logger.info("Database migration to v2 complete")
 
     # ── User Profile ───────────────────────────────────────────────
 
@@ -114,6 +158,33 @@ class Database:
                 parts.append(f"{key}: {value}")
         return "; ".join(parts)
 
+    # ── Assistant Profile ────────────────────────────────────────────
+
+    def get_assistant_profile(self, assistant_id: str) -> dict[str, str]:
+        """Get all profile key-value pairs for a given assistant."""
+        rows = self.conn.execute(
+            "SELECT key, value FROM assistant_profile WHERE assistant_id = ?",
+            (assistant_id,),
+        ).fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    def set_assistant_profile(self, assistant_id: str, key: str, value: str) -> None:
+        """Set a profile key-value for a given assistant."""
+        self.conn.execute(
+            """INSERT INTO assistant_profile (assistant_id, key, value, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(assistant_id, key) DO UPDATE SET value = ?, updated_at = ?""",
+            (assistant_id, key, value, _now(), value, _now()),
+        )
+        self.conn.commit()
+
+    def get_assistant_profile_summary(self, assistant_id: str) -> str:
+        """Build a human-readable summary of an assistant's profile."""
+        profile = self.get_assistant_profile(assistant_id)
+        if not profile:
+            return ""
+        return "; ".join(f"{k}: {v}" for k, v in profile.items())
+
     # ── Conversations ──────────────────────────────────────────────
 
     def create_conversation(self) -> int:
@@ -141,21 +212,29 @@ class Database:
     # ── Messages ───────────────────────────────────────────────────
 
     def insert_message(
-        self, conv_id: int, role: str, content: str, emotion: str | None = None
+        self,
+        conv_id: int,
+        role: str,
+        content: str,
+        emotion: str | None = None,
+        assistant_id: str | None = None,
     ) -> None:
         self.conn.execute(
-            """INSERT INTO messages (conversation_id, role, content, timestamp, emotion)
-               VALUES (?, ?, ?, ?, ?)""",
-            (conv_id, role, content, _now(), emotion),
+            """INSERT INTO messages (conversation_id, role, content, timestamp, emotion, assistant_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (conv_id, role, content, _now(), emotion, assistant_id),
         )
         self.conn.commit()
 
     def get_session_messages(self, conv_id: int) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+            "SELECT role, content, assistant_id FROM messages WHERE conversation_id = ? ORDER BY id",
             (conv_id,),
         ).fetchall()
-        return [{"role": row["role"], "content": row["content"]} for row in rows]
+        return [
+            {"role": row["role"], "content": row["content"], "assistant_id": row["assistant_id"]}
+            for row in rows
+        ]
 
     def get_recent_summaries(self, limit: int = 5) -> list[dict]:
         """Get recent conversation summaries (excluding current, most recent first)."""
@@ -185,13 +264,16 @@ class Database:
         if not conv:
             return []
         rows = self.conn.execute(
-            """SELECT role, content FROM messages
+            """SELECT role, content, assistant_id FROM messages
                WHERE conversation_id = ? AND role IN ('user', 'assistant')
                ORDER BY id DESC LIMIT ?""",
             (conv["id"], limit),
         ).fetchall()
         # Reverse to chronological order
-        return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+        return [
+            {"role": row["role"], "content": row["content"], "assistant_id": row["assistant_id"]}
+            for row in reversed(rows)
+        ]
 
     # ── Maintenance ────────────────────────────────────────────────
 
@@ -201,6 +283,7 @@ class Database:
             DELETE FROM messages;
             DELETE FROM conversations;
             DELETE FROM user_profile;
+            DELETE FROM assistant_profile;
         """)
         self.conn.commit()
 

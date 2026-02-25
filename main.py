@@ -1,7 +1,8 @@
-"""Eigy AI Assistant — Entry point.
+"""Eigy AI Assistant — Entry point (dual assistant mode).
 
 Pygame runs in MAIN thread, chat + TTS in daemon thread.
 Communication via thread-safe queues.
+Supports two assistants: Eigy + Delan.
 """
 
 from __future__ import annotations
@@ -41,8 +42,6 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
-_NAME = config.ASSISTANT_NAME
-
 # Strip emoji/emoticons from LLM output (prevents TTS reading them)
 _EMOJI_RE = re.compile(
     "["
@@ -61,6 +60,35 @@ _EMOJI_RE = re.compile(
     "\U00002300-\U000023FF"  # misc technical
     "]+",
 )
+
+# Input prefix parsing: ED/E/D
+_PREFIX_RE = re.compile(r"^(ED|E|D)\s+", re.IGNORECASE)
+
+# Discussion mode commands (supports both "discussion mode" and "conversation mode")
+_DISCUSSION_START_RE = re.compile(r"^(?:discussion|conversation)\s+mode(?:\s+(.+))?$", re.IGNORECASE)
+_DISCUSSION_END_RE = re.compile(r"^end\s+(?:discussion|conversation)\s+mode$", re.IGNORECASE)
+
+
+def parse_user_input(text: str) -> tuple[list[str], str]:
+    """Parse user input for target prefix.
+
+    Returns (target_ids, clean_text).
+    "ED ahoj" → (["eigy", "delan"], "ahoj")
+    "E ahoj"  → (["eigy"], "ahoj")
+    "D ahoj"  → (["delan"], "ahoj")
+    "ahoj"    → (["eigy", "delan"], "ahoj")
+    """
+    m = _PREFIX_RE.match(text)
+    if m:
+        prefix = m.group(1).upper()
+        clean = text[m.end():].strip()
+        if prefix == "ED":
+            return (["eigy", "delan"], clean)
+        elif prefix == "E":
+            return (["eigy"], clean)
+        elif prefix == "D":
+            return (["delan"], clean)
+    return (["eigy", "delan"], text)
 
 
 # ── Chat thread (daemon) ──────────────────────────────────────────
@@ -88,7 +116,10 @@ async def chat_main(
     audio_player: AudioPlayer,
 ) -> None:
     """Async chat main — init memory, onboard, run chat loop."""
-    tts = TTSEngine()
+    tts_engines: dict[str, TTSEngine] = {
+        "eigy": TTSEngine("eigy"),
+        "delan": TTSEngine("delan"),
+    }
 
     # Validate configuration
     warnings = config.validate_config()
@@ -110,10 +141,10 @@ async def chat_main(
     try:
         # First-run onboarding
         if db.is_first_run():
-            await first_run_onboarding(memory, tts, audio_player, avatar_queue)
+            await first_run_onboarding(memory, tts_engines, audio_player, avatar_queue)
 
         # Main chat loop
-        await chat_loop(db, memory, tts, audio_player, avatar_queue)
+        await chat_loop(db, memory, tts_engines, audio_player, avatar_queue)
 
         # End session
         display.show_system("Ukládám relaci...")
@@ -129,19 +160,21 @@ async def chat_main(
 
 async def first_run_onboarding(
     memory: MemoryManager,
-    tts: TTSEngine,
+    tts_engines: dict[str, TTSEngine],
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
 ) -> None:
-    """First-launch onboarding — Eigy introduces herself and asks for user's name."""
+    """First-launch onboarding — Eigy and Delan introduce themselves."""
     display.show_welcome_banner()
 
-    greeting = (
-        "Dobrý den. Jsem vaše osobní asistentka. "
+    # Eigy greets first
+    greeting_eigy = (
+        "Dobrý den. Jsem Eigy, vaše osobní asistentka. "
         "Než začneme — jak vám mám říkat?"
     )
-    display.show_assistant(greeting)
-    await _speak(greeting, tts, audio_player, avatar_queue)
+    display.show_assistant(greeting_eigy, "eigy")
+    await _speak(greeting_eigy, tts_engines["eigy"], audio_player, avatar_queue, "eigy")
+    await _wait_for_audio_complete(audio_player)
 
     name = await display.get_user_input()
     if not name:
@@ -150,14 +183,25 @@ async def first_run_onboarding(
     memory.profile.set_name(name)
     memory.user_name = name
 
-    response = (
-        f"Těší mě, {name}. Jsem {_NAME} — vaše osobní AI asistentka. "
-        f"Budu si pamatovat, co mi řeknete, a pomohu vám s čímkoli potřebujete. "
-        "Napište /help pro seznam příkazů."
+    # Eigy confirms
+    response_eigy = (
+        f"Těší mě, {name}. Jsem Eigy — budu si pamatovat, "
+        f"co mi řeknete, a pomohu vám s čímkoli potřebujete."
     )
-    display.show_assistant(response)
-    avatar_queue.put({"type": "emotion", "value": "happy"})
-    await _speak(response, tts, audio_player, avatar_queue)
+    display.show_assistant(response_eigy, "eigy")
+    avatar_queue.put({"type": "emotion", "value": "happy", "target": "eigy"})
+    await _speak(response_eigy, tts_engines["eigy"], audio_player, avatar_queue, "eigy")
+    await _wait_for_audio_complete(audio_player)
+
+    # Delan introduces himself
+    response_delan = (
+        f"A já jsem Delan. Řekněme, že jsem ten kreativnější z nás dvou. "
+        f"Rád vymýšlím věci, {name}. Napište /help pro příkazy."
+    )
+    display.show_assistant(response_delan, "delan")
+    avatar_queue.put({"type": "emotion", "value": "amused", "target": "delan"})
+    await _speak(response_delan, tts_engines["delan"], audio_player, avatar_queue, "delan")
+    await _wait_for_audio_complete(audio_player)
 
     display.console.print()
 
@@ -166,7 +210,7 @@ async def handle_command(
     user_input: str,
     memory: MemoryManager,
     db: Database,
-    tts: TTSEngine,
+    tts_engines: dict[str, TTSEngine],
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
     timer_mgr: TimerManager,
@@ -184,6 +228,12 @@ async def handle_command(
             display.show_system(f"Co o tobě vím: {summary}")
         else:
             display.show_system("Zatím o tobě nic nemám uložené.")
+        # Show assistant profiles
+        for aid in ("eigy", "delan"):
+            ap = db.get_assistant_profile_summary(aid)
+            if ap:
+                name = config.ASSISTANTS[aid]["name"]
+                display.show_system(f"Poznámky ({name}): {ap}")
         summaries = db.get_recent_summaries(limit=5)
         if summaries:
             display.show_system("Nedávné konverzace:")
@@ -191,7 +241,7 @@ async def handle_command(
                 display.show_system(f"  {s['date']}: {s['summary']}")
     elif cmd == "/forget":
         display.show_system(
-            "Tím smažeš VŠECHNY moje vzpomínky na tebe. Jsi si jistý/á? (ano/ne)"
+            "Tím smažeš VŠECHNY vzpomínky. Jsi si jistý/á? (ano/ne)"
         )
         confirm = await display.get_user_input()
         if confirm and confirm.lower() in ("ano", "a", "yes", "y"):
@@ -202,17 +252,20 @@ async def handle_command(
             display.show_system("Zrušeno.")
     elif cmd == "/voice":
         if arg and arg.lower() == "on":
-            tts.set_enabled(True)
-            display.show_system("Hlas zapnutý.")
+            for tts in tts_engines.values():
+                tts.set_enabled(True)
+            display.show_system("Hlas zapnutý (oba asistenti).")
         elif arg and arg.lower() == "off":
-            tts.set_enabled(False)
+            for tts in tts_engines.values():
+                tts.set_enabled(False)
             audio_player.stop()
             display.show_system("Hlas vypnutý.")
         elif arg:
-            tts.set_voice(arg)
+            for tts in tts_engines.values():
+                tts.set_voice(arg)
             display.show_system(f"Hlas nastaven na: {arg}")
         else:
-            status = "zapnutý" if tts.enabled else "vypnutý"
+            status = "zapnutý" if tts_engines["eigy"].enabled else "vypnutý"
             display.show_system(f"Hlas je {status}. Použití: /voice on|off|<jméno>")
     elif cmd == "/volume":
         if arg:
@@ -226,7 +279,9 @@ async def handle_command(
             display.show_system(f"Hlasitost: {int(audio_player.volume * 100)} %")
     elif cmd == "/emotion":
         if arg:
-            avatar_queue.put({"type": "emotion", "value": arg.lower()})
+            # Broadcast emotion to both panels
+            avatar_queue.put({"type": "emotion", "value": arg.lower(), "target": "eigy"})
+            avatar_queue.put({"type": "emotion", "value": arg.lower(), "target": "delan"})
             display.show_system(f"Emoce nastavena na: {arg}")
         else:
             display.show_system("Použití: /emotion neutral|amused|happy|concerned|surprised|thinking")
@@ -267,14 +322,21 @@ async def handle_command(
         msgs = db.get_session_messages(memory.session_id)
         if msgs:
             for m in msgs:
-                role = "Ty" if m["role"] == "user" else _NAME
-                display.show_system(f"  {role}: {m['content'][:100]}...")
+                if m["role"] == "user":
+                    role_name = "Ty"
+                else:
+                    aid = m.get("assistant_id", "eigy")
+                    role_name = config.ASSISTANTS.get(aid, {}).get("name", "Assistant")
+                display.show_system(f"  {role_name}: {m['content'][:100]}...")
         else:
             display.show_system("V této relaci zatím žádné zprávy.")
     elif cmd == "/export":
         import json as _json
         export_data = {
             "profile": db.get_all_profile(),
+            "assistant_profiles": {
+                aid: db.get_assistant_profile(aid) for aid in ("eigy", "delan")
+            },
             "conversations": [],
         }
         summaries = db.get_recent_summaries(limit=100)
@@ -448,25 +510,19 @@ async def _imessage_watcher(
     event_queue: asyncio.Queue,
     imessage_db_holder: list,
 ) -> None:
-    """Async background task: polls iMessage DB for new messages.
-
-    Pushes {"type": "imessage_new", "messages": [...]} events.
-    imessage_db_holder is a 1-element list so we can lazy-init and share.
-    """
+    """Async background task: polls iMessage DB for new messages."""
     from pathlib import Path
 
     db_path = Path.home() / "Library" / "Messages" / "chat.db"
     if not db_path.exists():
         return
 
-    # Try to open DB
     try:
         watcher_db = MessagesDB(db_path)
     except Exception:
         return
 
     last_rowid = watcher_db.get_latest_rowid()
-    # Share DB instance so zobraz/reply can reuse it
     if not imessage_db_holder[0]:
         imessage_db_holder[0] = watcher_db
 
@@ -491,13 +547,7 @@ async def _wait_for_action(
     event_queue: asyncio.Queue,
     input_task: asyncio.Task | None = None,
 ) -> tuple[str, object, asyncio.Task | None]:
-    """Race between user input and internal events (timers, idle).
-
-    Returns (action_type, payload, ongoing_input_task).
-    - ("input", user_text, None) — user typed something
-    - ("timer_expired", event_dict, input_task) — timer fired
-    - ("idle_trigger", event_dict, input_task) — idle timeout
-    """
+    """Race between user input and internal events."""
     if input_task is None:
         input_task = asyncio.create_task(display.get_user_input())
 
@@ -509,7 +559,6 @@ async def _wait_for_action(
     )
 
     if input_task in done:
-        # User typed something — cancel event wait
         event_task.cancel()
         try:
             await event_task
@@ -517,42 +566,167 @@ async def _wait_for_action(
             pass
         return ("input", input_task.result(), None)
     else:
-        # Internal event fired — DON'T cancel input (user may be typing)
         event = event_task.result()
         return (event.get("type", "unknown"), event, input_task)
+
+
+# ── Generate assistant response ──────────────────────────────────
+
+
+async def generate_assistant_response(
+    assistant_id: str,
+    memory: MemoryManager,
+    current_messages: list[dict],
+    tts_engines: dict[str, TTSEngine],
+    audio_player: AudioPlayer,
+    avatar_queue: queue.Queue,
+    extra_context: list[dict] | None = None,
+    discussion_mode: bool = False,
+) -> str | None:
+    """Generate a response from one assistant.
+
+    Handles: build context → LLM stream → display → TTS → avatar events → save.
+    Returns response text, or None if the assistant passed ([PASS]).
+    """
+    tts = tts_engines[assistant_id]
+
+    # Build context for this assistant
+    messages = memory.build_context_for(assistant_id, current_messages, discussion_mode)
+
+    # Inject extra context (search results, crypto data) before last message
+    if extra_context:
+        for ctx in extra_context:
+            messages.insert(-1, ctx)
+
+    # Notify avatar: thinking
+    avatar_queue.put({"type": "thinking_start", "target": assistant_id})
+
+    # Limit token output in discussion mode for short, snappy replies
+    max_tokens = 250 if discussion_mode else 4096
+
+    # Stream response
+    stream_display = display.StreamingDisplay(assistant_id)
+    sentence_buffer = SentenceBuffer()
+    full_response: list[str] = []
+    tts_tasks: list[asyncio.Task] = []
+    first_token = True
+
+    try:
+        stream_display.start()
+        async for token in chat_engine.get_response(messages, max_tokens=max_tokens):
+            # Strip emoji
+            token = _EMOJI_RE.sub("", token)
+            if not token:
+                continue
+
+            if first_token:
+                avatar_queue.put({"type": "thinking_end", "target": assistant_id})
+                avatar_queue.put({"type": "speaking_start", "target": assistant_id})
+                first_token = False
+
+            stream_display.token(token)
+            full_response.append(token)
+
+            # Sentence-level TTS
+            if tts.enabled:
+                sentences = sentence_buffer.add_token(token)
+                for sentence in sentences:
+                    task = asyncio.create_task(
+                        _synthesize_and_enqueue(sentence, tts, audio_player, assistant_id)
+                    )
+                    tts_tasks.append(task)
+
+        stream_display.end()
+        avatar_queue.put({"type": "speaking_end", "target": assistant_id})
+
+        # Flush remaining text to TTS
+        if tts.enabled:
+            remaining = sentence_buffer.flush()
+            if remaining:
+                task = asyncio.create_task(
+                    _synthesize_and_enqueue(remaining, tts, audio_player, assistant_id)
+                )
+                tts_tasks.append(task)
+
+        # Wait for TTS synthesis to complete
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
+
+    except Exception as e:
+        stream_display.end()
+        avatar_queue.put({"type": "thinking_end", "target": assistant_id})
+        display.show_error(f"Odpověď {config.ASSISTANTS[assistant_id]['name']} selhala: {e}")
+        return None
+
+    response_text = "".join(full_response).strip()
+
+    # In discussion mode, strip [PASS] if it somehow sneaks through — assistants must respond
+    if discussion_mode:
+        response_text = response_text.replace(config.PASS_TOKEN, "").strip()
+    # Check for PASS token (only in normal mode)
+    if not discussion_mode and (config.PASS_TOKEN in response_text or not response_text):
+        avatar_queue.put({"type": "thinking_end", "target": assistant_id})
+        return None
+    if not response_text:
+        avatar_queue.put({"type": "thinking_end", "target": assistant_id})
+        return None
+
+    # Emotion detection
+    if config.EMOTION_DETECTION == "llm":
+        emotion = await detect_emotion_llm(response_text)
+    else:
+        emotion = detect_emotion(response_text)
+    avatar_queue.put({"type": "emotion", "value": emotion, "target": assistant_id})
+
+    # Save to memory and current messages
+    current_messages.append({
+        "role": "assistant",
+        "content": response_text,
+        "assistant_id": assistant_id,
+    })
+    memory.save_message("assistant", response_text, emotion=emotion, assistant_id=assistant_id)
+
+    return response_text
+
+
+# ── Audio wait helper ─────────────────────────────────────────────
+
+
+async def _wait_for_audio_complete(audio_player: AudioPlayer) -> None:
+    """Wait until all queued audio has finished playing."""
+    while audio_player.playing or not audio_player.audio_queue.empty():
+        await asyncio.sleep(0.1)
 
 
 # ── Proactive response ────────────────────────────────────────────
 
 PROACTIVE_PROMPT = """\
-Jsi {assistant_name}, osobní AI asistentka. Právě je chvíli ticho v konverzaci s {user_name}.
+Jsi {assistant_name}, osobní AI asistent/ka. Právě je chvíli ticho v konverzaci s {user_name}.
 Řekni něco přirozeného — zeptej se na něco, nabídni pomoc, udělej postřeh, nebo navrhni aktivitu.
-Buď stručná (1-2 věty). Nebuď otravná, buď přirozená.
+Buď stručný/á (1-2 věty). Nebuď otravný/á, buď přirozený/á.
 Odpovídej ČESKY. NEPOUŽÍVEJ *akce v hvězdičkách*.\
 """
 
 
 async def proactive_response(
     text: str | None,
+    assistant_id: str,
     memory: MemoryManager,
-    tts: TTSEngine,
+    tts_engines: dict[str, TTSEngine],
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
     current_messages: list[dict],
 ) -> None:
-    """Generate and display a proactive message from Eigy.
+    """Generate and display a proactive message from an assistant."""
+    tts = tts_engines[assistant_id]
+    name = config.ASSISTANTS[assistant_id]["name"]
 
-    If text is provided, use it directly (e.g., timer notification).
-    If text is None, ask the LLM to generate a contextual message.
-    """
     if text is None:
-        # Generate contextual message via LLM
         try:
             proactive_system = PROACTIVE_PROMPT.format(
-                assistant_name=config.ASSISTANT_NAME,
+                assistant_name=name,
                 user_name=memory.user_name,
             )
-            # Build slim context: system + last few messages
             messages: list[dict] = [
                 {"role": "system", "content": proactive_system},
             ]
@@ -562,12 +736,11 @@ async def proactive_response(
                     "role": "system",
                     "content": f"Znáš o {memory.user_name}: {profile_summary}",
                 })
-            # Add last 5 messages for context
             recent = current_messages[-5:] if len(current_messages) > 5 else current_messages
             messages.extend(recent)
             messages.append({
                 "role": "user",
-                "content": "(ticho — řekni něco sama od sebe)",
+                "content": "(ticho — řekni něco sám/sama od sebe)",
             })
 
             response_parts: list[str] = []
@@ -582,21 +755,25 @@ async def proactive_response(
             return
 
     # Display and speak
-    display.show_assistant(text)
+    display.show_assistant(text, assistant_id)
 
     # Detect emotion
     if config.EMOTION_DETECTION == "llm":
         emotion = await detect_emotion_llm(text)
     else:
         emotion = detect_emotion(text)
-    avatar_queue.put({"type": "emotion", "value": emotion})
+    avatar_queue.put({"type": "emotion", "value": emotion, "target": assistant_id})
 
     # Save to memory
-    current_messages.append({"role": "assistant", "content": text})
-    memory.save_message("assistant", text, emotion=emotion)
+    current_messages.append({
+        "role": "assistant",
+        "content": text,
+        "assistant_id": assistant_id,
+    })
+    memory.save_message("assistant", text, emotion=emotion, assistant_id=assistant_id)
 
     # TTS
-    await _speak(text, tts, audio_player, avatar_queue)
+    await _speak(text, tts, audio_player, avatar_queue, assistant_id)
 
 
 # ── Main chat loop ────────────────────────────────────────────────
@@ -605,27 +782,24 @@ async def proactive_response(
 async def chat_loop(
     db: Database,
     memory: MemoryManager,
-    tts: TTSEngine,
+    tts_engines: dict[str, TTSEngine],
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
 ) -> None:
-    """Main chat loop — input, stream response, display, TTS, avatar events."""
+    """Main chat loop — dual assistant orchestration."""
     current_messages: list[dict] = []
 
-    # iMessage integration state (lazy-initialized on first use)
-    imessage_db_holder: list = [None]  # mutable holder for lazy-init sharing
+    # iMessage integration state
+    imessage_db_holder: list = [None]
     imessage_cache: list[IMessage] = []
     imessage_contacts = ContactBook()
 
-    # Initialize timer manager and idle monitor
+    # Timer and idle monitors
     event_queue: asyncio.Queue = asyncio.Queue()
     timer_mgr = TimerManager(event_queue)
     idle_monitor = IdleMonitor(event_queue)
 
-    # Start idle monitor background task
     idle_task = asyncio.create_task(idle_monitor.run())
-
-    # Start iMessage watcher (pushes imessage_new events to queue)
     imessage_watcher_task = asyncio.create_task(
         _imessage_watcher(event_queue, imessage_db_holder)
     )
@@ -633,10 +807,20 @@ async def chat_loop(
     # Greeting for returning users
     if memory.user_name not in ("friend", "šéfe"):
         display.show_welcome_banner()
-        greeting = f"Vítejte zpět, {memory.user_name}. Jak vám mohu pomoci?"
-        display.show_assistant(greeting)
-        avatar_queue.put({"type": "emotion", "value": "happy"})
-        await _speak(greeting, tts, audio_player, avatar_queue)
+
+        # Eigy greets
+        greeting_eigy = f"Vítejte zpět, {memory.user_name}. Jak vám mohu pomoci?"
+        display.show_assistant(greeting_eigy, "eigy")
+        avatar_queue.put({"type": "emotion", "value": "happy", "target": "eigy"})
+        await _speak(greeting_eigy, tts_engines["eigy"], audio_player, avatar_queue, "eigy")
+        await _wait_for_audio_complete(audio_player)
+
+        # Delan greets
+        greeting_delan = f"Jo, {memory.user_name}, jsem tady taky. Co dneska vymyslíme?"
+        display.show_assistant(greeting_delan, "delan")
+        avatar_queue.put({"type": "emotion", "value": "amused", "target": "delan"})
+        await _speak(greeting_delan, tts_engines["delan"], audio_player, avatar_queue, "delan")
+        await _wait_for_audio_complete(audio_player)
 
     display.show_system("Napiš /help pro příkazy, 'exit' pro ukončení.")
 
@@ -644,7 +828,6 @@ async def chat_loop(
 
     try:
         while True:
-            # Wait for user input OR internal event
             action_type, payload, ongoing_input_task = await _wait_for_action(
                 event_queue, ongoing_input_task
             )
@@ -652,34 +835,46 @@ async def chat_loop(
             if action_type == "input":
                 user_input = payload
                 idle_monitor.reset()
-                audio_player.stop()  # interrupt any playing speech
+                audio_player.stop()
 
                 if user_input is None:
-                    break  # EOF / Ctrl+D
+                    break  # EOF
 
-                # Exit commands
+                # Exit
                 if user_input.lower() in ("exit", "quit", "konec"):
-                    farewell = (
-                        f"Na shledanou, {memory.user_name}. "
-                        "Kdybyste cokoli potřebovali, jsem tu."
-                    )
-                    display.show_assistant(farewell)
-                    await _speak(farewell, tts, audio_player, avatar_queue)
+                    farewell_eigy = f"Na shledanou, {memory.user_name}."
+                    farewell_delan = "Zase příště. Mezitím něco vymyslím."
+                    display.show_assistant(farewell_eigy, "eigy")
+                    await _speak(farewell_eigy, tts_engines["eigy"], audio_player, avatar_queue, "eigy")
+                    await _wait_for_audio_complete(audio_player)
+                    display.show_assistant(farewell_delan, "delan")
+                    await _speak(farewell_delan, tts_engines["delan"], audio_player, avatar_queue, "delan")
+                    await _wait_for_audio_complete(audio_player)
                     break
 
-                # Empty input
                 if not user_input:
                     continue
 
                 # Commands
                 if user_input.startswith("/"):
                     await handle_command(
-                        user_input, memory, db, tts, audio_player,
+                        user_input, memory, db, tts_engines, audio_player,
                         avatar_queue, timer_mgr,
                     )
                     continue
 
-                # iMessage commands (zobraz imessage, odepiš na imessage, kontakty)
+                # Discussion mode start
+                disc_match = _DISCUSSION_START_RE.match(user_input.strip())
+                if disc_match:
+                    topic = disc_match.group(1) or None
+                    ongoing_input_task = await _run_discussion_mode(
+                        topic, memory, current_messages,
+                        tts_engines, audio_player, avatar_queue,
+                        event_queue, idle_monitor, timer_mgr,
+                    )
+                    continue
+
+                # iMessage commands
                 imsg_cmd = detect_imessage_command(user_input)
                 if imsg_cmd:
                     imessage_db_holder[0], imessage_cache, _ = await handle_imessage_command(
@@ -689,167 +884,98 @@ async def chat_loop(
                     )
                     continue
 
-                # Check for timer request in natural language
-                timer_req = parse_timer_request(user_input)
+                # Parse targets (ED/E/D prefix)
+                targets, clean_text = parse_user_input(user_input)
+
+                # Timer request (still pass to LLM)
+                timer_req = parse_timer_request(clean_text)
                 if timer_req:
                     seconds, label = timer_req
                     timer_id = timer_mgr.add_timer(seconds, label)
-                    display.show_system(
-                        f"Timer nastaven: {label} (ID: {timer_id})"
-                    )
-                    # Still pass to LLM so Eigy can respond naturally
+                    display.show_system(f"Timer nastaven: {label} (ID: {timer_id})")
 
-                # Check for crypto price request (before web search)
-                crypto_context = None
-                crypto_id = detect_crypto_request(user_input)
+                # Crypto & web search enrichment
+                extra_context: list[dict] = []
+
+                crypto_id = detect_crypto_request(clean_text)
                 if crypto_id:
                     display.show_system(f"Načítám cenu: {crypto_id}...")
-                    avatar_queue.put({"type": "thinking_start"})
                     price_data = await fetch_crypto_price(crypto_id)
                     if price_data:
                         crypto_context = format_crypto_price(crypto_id, price_data)
+                        extra_context.append({
+                            "role": "system",
+                            "content": (
+                                f"{crypto_context}\n\n"
+                                "INSTRUKCE: Toto jsou ŽIVÁ tržní data z CoinGecko API. "
+                                "Použij PŘESNĚ tyto hodnoty ve své odpovědi. NEVYMÝŠLEJ jiné ceny."
+                            ),
+                        })
 
-                # Check for web search request
-                search_query = detect_search_request(user_input)
-                search_context = None
-                if search_query and not crypto_context:
-                    # Skip web search if we already have live crypto data
+                search_query = detect_search_request(clean_text)
+                if search_query and not crypto_id:
                     display.show_system(f"Hledám: {search_query}...")
-                    if not crypto_id:
-                        avatar_queue.put({"type": "thinking_start"})
                     results = await web_search(search_query)
                     if results:
                         search_context = format_search_results(results)
+                        extra_context.append({
+                            "role": "system",
+                            "content": (
+                                f"VÝSLEDKY VYHLEDÁVÁNÍ pro \"{search_query}\":\n\n"
+                                f"{search_context}\n\n"
+                                "INSTRUKCE: Využij výše uvedené výsledky k sestavení "
+                                "přesné odpovědi. Na konci uveď zdroje STRUČNĚ jen názvem domény."
+                            ),
+                        })
 
-                # Add user message
-                current_messages.append({"role": "user", "content": user_input})
-                memory.save_message("user", user_input)
+                # Add user message to history
+                current_messages.append({
+                    "role": "user",
+                    "content": clean_text,
+                    "assistant_id": None,
+                })
+                memory.save_message("user", clean_text)
 
-                # Build context with memory
-                messages = memory.build_context(current_messages)
-
-                # Inject crypto price data
-                if crypto_context:
-                    messages.insert(-1, {
-                        "role": "system",
-                        "content": (
-                            f"{crypto_context}\n\n"
-                            "INSTRUKCE: Toto jsou ŽIVÁ tržní data z CoinGecko API. "
-                            "Použij PŘESNĚ tyto hodnoty ve své odpovědi. NEVYMÝŠLEJ jiné ceny."
-                        ),
-                    })
-
-                # Inject search results into context (before the last user message)
-                if search_context:
-                    messages.insert(-1, {
-                        "role": "system",
-                        "content": (
-                            f"VÝSLEDKY VYHLEDÁVÁNÍ pro \"{search_query}\":\n\n"
-                            f"{search_context}\n\n"
-                            "INSTRUKCE: Využij výše uvedené výsledky a obsah stránek k sestavení "
-                            "přesné a informativní odpovědi. Uváděj konkrétní fakta z obsahu. "
-                            "Na konci uveď zdroje STRUČNĚ jen názvem domény (např. 'Zdroje: mobilmania.cz, itmix.cz') — "
-                            "NIKDY nevypisuj celé URL adresy. Pokud výsledky nejsou relevantní, "
-                            "řekni to a odpověz z vlastních znalostí."
-                        ),
-                    })
-
-                # Notify avatar: thinking
-                if not search_query:
-                    avatar_queue.put({"type": "thinking_start"})
-
-                # Stream response with sentence-level TTS
-                stream_display = display.StreamingDisplay()
-                sentence_buffer = SentenceBuffer()
-                full_response: list[str] = []
-                tts_tasks: list[asyncio.Task] = []
-                first_token = True
-
-                try:
-                    stream_display.start()
-                    async for token in chat_engine.get_response(messages):
-                        # Strip emoji from output
-                        token = _EMOJI_RE.sub("", token)
-                        if not token:
-                            continue
-
-                        if first_token:
-                            avatar_queue.put({"type": "thinking_end"})
-                            avatar_queue.put({"type": "speaking_start"})
-                            first_token = False
-
-                        stream_display.token(token)
-                        full_response.append(token)
-
-                        # Sentence-level TTS
-                        if tts.enabled:
-                            sentences = sentence_buffer.add_token(token)
-                            for sentence in sentences:
-                                task = asyncio.create_task(
-                                    _synthesize_and_enqueue(sentence, tts, audio_player)
-                                )
-                                tts_tasks.append(task)
-
-                    stream_display.end()
-                    avatar_queue.put({"type": "speaking_end"})
-
-                    # Flush remaining text to TTS
-                    if tts.enabled:
-                        remaining = sentence_buffer.flush()
-                        if remaining:
-                            task = asyncio.create_task(
-                                _synthesize_and_enqueue(remaining, tts, audio_player)
-                            )
-                            tts_tasks.append(task)
-
-                    # Wait for all TTS tasks
-                    if tts_tasks:
-                        await asyncio.gather(*tts_tasks, return_exceptions=True)
-
-                except Exception as e:
-                    stream_display.end()
-                    avatar_queue.put({"type": "thinking_end"})
-                    display.show_error(f"Odpověď selhala: {e}")
-                    current_messages.pop()
-                    continue
-
-                # Save assistant response and detect emotion
-                response_text = "".join(full_response)
-                current_messages.append({"role": "assistant", "content": response_text})
-
-                # Emotion detection
-                if config.EMOTION_DETECTION == "llm":
-                    emotion = await detect_emotion_llm(response_text)
-                else:
-                    emotion = detect_emotion(response_text)
-                avatar_queue.put({"type": "emotion", "value": emotion})
-
-                memory.save_message("assistant", response_text, emotion=emotion)
+                # Generate responses from targeted assistants (no autonomous loop)
+                for aid in targets:
+                    response = await generate_assistant_response(
+                        aid, memory, current_messages,
+                        tts_engines, audio_player, avatar_queue,
+                        extra_context=extra_context if extra_context else None,
+                    )
+                    # Wait for audio to finish before next assistant speaks
+                    await _wait_for_audio_complete(audio_player)
 
                 # Real-time fact extraction (background, non-blocking)
-                asyncio.create_task(
-                    memory.extract_facts_realtime(user_input, response_text)
-                )
+                last_assistant_msg = ""
+                for m in reversed(current_messages):
+                    if m["role"] == "assistant":
+                        last_assistant_msg = m["content"]
+                        break
+                if last_assistant_msg:
+                    asyncio.create_task(
+                        memory.extract_facts_realtime(clean_text, last_assistant_msg)
+                    )
 
             elif action_type == "timer_expired":
-                # Timer expired — Eigy proactively notifies
                 label = payload.get("label", "timer")
                 notification = f"Čas vypršel — {label} je u konce."
                 idle_monitor.reset()
                 await proactive_response(
-                    notification, memory, tts, audio_player,
+                    notification, "eigy", memory, tts_engines, audio_player,
                     avatar_queue, current_messages,
                 )
 
             elif action_type == "idle_trigger":
-                # Idle timeout — Eigy says something contextual
+                # Alternate which assistant speaks during idle
+                import random
+                idle_speaker = random.choice(["eigy", "delan"])
                 await proactive_response(
-                    None, memory, tts, audio_player,
+                    None, idle_speaker, memory, tts_engines, audio_player,
                     avatar_queue, current_messages,
                 )
 
             elif action_type == "imessage_new":
-                # New iMessage arrived — display and read aloud
                 msg = payload.get("message")
                 if msg:
                     name = imessage_contacts.get_name(msg.sender)
@@ -857,12 +983,11 @@ async def chat_loop(
                     display.show_system(f"  iMessage od {name}: {msg.text}")
                     idle_monitor.reset()
                     await proactive_response(
-                        notification, memory, tts, audio_player,
+                        notification, "eigy", memory, tts_engines, audio_player,
                         avatar_queue, current_messages,
                     )
 
     finally:
-        # Cleanup
         idle_monitor.stop()
         timer_mgr.cancel_all()
         idle_task.cancel()
@@ -879,26 +1004,133 @@ async def chat_loop(
             pass
 
 
+# ── Discussion mode ───────────────────────────────────────────────
+
+
+async def _run_discussion_mode(
+    topic: str | None,
+    memory: MemoryManager,
+    current_messages: list[dict],
+    tts_engines: dict[str, TTSEngine],
+    audio_player: AudioPlayer,
+    avatar_queue: queue.Queue,
+    event_queue: asyncio.Queue,
+    idle_monitor: IdleMonitor,
+    timer_mgr: TimerManager,
+) -> asyncio.Task | None:
+    """Run discussion mode — assistants talk to each other.
+
+    User can interject at any time. Returns ongoing input task (if any)
+    for the main loop to continue with.
+    """
+    display.show_system(
+        "Diskuzní mód aktivován. Napište 'end discussion mode' pro ukončení."
+    )
+
+    # If user provided a topic, add it as a user message
+    if topic:
+        display.show_user(topic)
+        current_messages.append({
+            "role": "user",
+            "content": topic,
+            "assistant_id": None,
+        })
+        memory.save_message("user", topic)
+
+    # Eigy starts the discussion
+    next_speaker = "eigy"
+    input_task: asyncio.Task | None = None
+
+    for turn in range(config.DISCUSSION_MAX_TURNS):
+        # Generate response from current speaker (pass is disabled in discussion mode)
+        response = await generate_assistant_response(
+            next_speaker, memory, current_messages,
+            tts_engines, audio_player, avatar_queue,
+            discussion_mode=True,
+        )
+
+        if response is None:
+            # Shouldn't happen in discussion mode, but handle gracefully
+            # Strip any [PASS] from the response context and retry with the other speaker
+            next_speaker = "eigy" if next_speaker == "delan" else "delan"
+            continue
+
+        # Wait for audio to finish
+        await _wait_for_audio_complete(audio_player)
+
+        # Check if user typed something during the response/audio
+        if input_task is None:
+            input_task = asyncio.create_task(display.get_user_input())
+
+        # Brief wait — give user a chance to type between turns
+        done, _ = await asyncio.wait({input_task}, timeout=1.0)
+
+        if done:
+            user_text = input_task.result()
+            input_task = None
+
+            if user_text is None:
+                # EOF
+                break
+
+            # Check for end discussion mode
+            if _DISCUSSION_END_RE.match(user_text.strip()):
+                display.show_system("Diskuzní mód ukončen.")
+                return None
+
+            # User interjected — add their message and continue
+            if user_text.strip():
+                display.show_user(user_text)
+                current_messages.append({
+                    "role": "user",
+                    "content": user_text,
+                    "assistant_id": None,
+                })
+                memory.save_message("user", user_text)
+                idle_monitor.reset()
+
+        # Alternate speaker
+        next_speaker = "eigy" if next_speaker == "delan" else "delan"
+
+        # Also handle timer events during discussion
+        while not event_queue.empty():
+            try:
+                evt = event_queue.get_nowait()
+                evt_type = evt.get("type")
+                if evt_type == "timer_expired":
+                    label = evt.get("label", "timer")
+                    display.show_system(f"  Timer: {label} je u konce.")
+            except Exception:
+                break
+
+    else:
+        display.show_system("Diskuzní mód ukončen (max. výměn dosaženo).")
+
+    # Return the ongoing input task so main loop can use it
+    return input_task
+
+
 async def _speak(
     text: str,
     tts: TTSEngine,
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
+    speaker: str = "eigy",
 ) -> None:
     """Synthesize and enqueue a complete text for TTS."""
     if tts.enabled:
         path = await tts.synthesize(text)
         if path:
-            audio_player.enqueue(path)
+            audio_player.enqueue(path, speaker)
 
 
 async def _synthesize_and_enqueue(
-    text: str, tts: TTSEngine, audio_player: AudioPlayer
+    text: str, tts: TTSEngine, audio_player: AudioPlayer, speaker: str = "eigy"
 ) -> None:
     """Helper: synthesize text and add to audio queue."""
     path = await tts.synthesize(text)
     if path:
-        audio_player.enqueue(path)
+        audio_player.enqueue(path, speaker)
 
 
 # ── Entry point ────────────────────────────────────────────────────
@@ -906,13 +1138,9 @@ async def _synthesize_and_enqueue(
 
 def main() -> None:
     """Entry point: start Pygame in main thread, chat in daemon thread."""
-    # Create thread-safe queues
     avatar_queue: queue.Queue = queue.Queue()
-
-    # Create audio player
     audio_player = AudioPlayer(avatar_queue=avatar_queue)
 
-    # Start chat in daemon thread
     chat = threading.Thread(
         target=chat_thread_main,
         args=(avatar_queue, audio_player),
@@ -920,7 +1148,6 @@ def main() -> None:
     )
     chat.start()
 
-    # Run Pygame avatar in main thread (REQUIRED on macOS)
     from avatar.window import avatar_main
 
     try:

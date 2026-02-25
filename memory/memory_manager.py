@@ -70,19 +70,36 @@ class MemoryManager:
         )
 
     def build_context(self, current_messages: list[dict]) -> list[dict]:
-        """Build the full messages array for the LLM with relevant history.
+        """Build the full messages array for the LLM (legacy single-assistant)."""
+        return self.build_context_for("eigy", current_messages)
+
+    def build_context_for(
+        self,
+        assistant_id: str,
+        current_messages: list[dict],
+        discussion_mode: bool = False,
+    ) -> list[dict]:
+        """Build the full messages array for a specific assistant.
 
         Layers:
-        1. System prompt (with user name)
+        1. System prompt (per-assistant, with dual awareness)
         2. User profile summary
-        3. Recent conversation summaries
-        4. Tail of previous session
-        5. Current session messages
+        3. Assistant profile summary
+        4. Recent conversation summaries
+        5. Tail of previous session (role-remapped)
+        6. Current session messages (role-remapped)
+
+        Role remapping (Anthropic API requires strict user/assistant alternation):
+        - For Eigy: eigy messages → assistant, delan messages → user with [Delan]: prefix
+        - For Delan: delan messages → assistant, eigy messages → user with [Eigy]: prefix
+        - User messages → user with [{user_name}]: prefix
+        - Consecutive same-role messages are merged
         """
         context: list[dict] = []
 
-        # 1. System prompt
-        context.append({"role": "system", "content": self.system_prompt})
+        # 1. System prompt (per-assistant with dual awareness)
+        system_prompt = config.get_system_prompt(assistant_id, self.user_name, discussion_mode)
+        context.append({"role": "system", "content": system_prompt})
 
         # 2. User profile
         profile_summary = self.db.get_user_profile_summary()
@@ -92,7 +109,25 @@ class MemoryManager:
                 "content": f"Co si pamatuješ o uživateli {self.user_name}: {profile_summary}",
             })
 
-        # 3. Recent conversation summaries
+        # 3. Assistant profile
+        assistant_profile = self.db.get_assistant_profile_summary(assistant_id)
+        if assistant_profile:
+            context.append({
+                "role": "system",
+                "content": f"Tvé osobní poznámky: {assistant_profile}",
+            })
+
+        # Other assistant's profile
+        other_id = "delan" if assistant_id == "eigy" else "eigy"
+        other_name = config.ASSISTANTS[other_id]["name"]
+        other_profile = self.db.get_assistant_profile_summary(other_id)
+        if other_profile:
+            context.append({
+                "role": "system",
+                "content": f"Poznámky od {other_name}: {other_profile}",
+            })
+
+        # 4. Recent conversation summaries
         summaries = self.db.get_recent_summaries(limit=config.MEMORY_SUMMARY_COUNT)
         if summaries:
             formatted = "\n".join(
@@ -103,7 +138,7 @@ class MemoryManager:
                 "content": f"Shrnutí nedávných konverzací:\n{formatted}",
             })
 
-        # 4. Tail of previous session (for continuity)
+        # 5. Tail of previous session (role-remapped)
         prev_messages = self.db.get_previous_session_messages(
             limit=config.MEMORY_TAIL_MESSAGES
         )
@@ -112,16 +147,66 @@ class MemoryManager:
                 "role": "system",
                 "content": "--- Minulá relace (poslední zprávy) ---",
             })
-            context.extend(prev_messages)
+            remapped_prev = self._remap_roles(assistant_id, prev_messages)
+            context.extend(remapped_prev)
 
-        # 5. Current session messages
-        context.extend(current_messages)
+        # 6. Current session messages (role-remapped)
+        remapped = self._remap_roles(assistant_id, current_messages)
+        context.extend(remapped)
 
         return context
 
-    def save_message(self, role: str, content: str, emotion: str | None = None) -> None:
+    def _remap_roles(self, assistant_id: str, messages: list[dict]) -> list[dict]:
+        """Remap message roles for a specific assistant's perspective.
+
+        Anthropic API requires strict user/assistant alternation.
+        """
+        other_id = "delan" if assistant_id == "eigy" else "eigy"
+        other_name = config.ASSISTANTS[other_id]["name"]
+
+        remapped: list[dict] = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            msg_assistant = msg.get("assistant_id")
+
+            if role == "system":
+                remapped.append(msg)
+                continue
+
+            if role == "assistant":
+                if msg_assistant == assistant_id or msg_assistant is None:
+                    # This assistant's own message → assistant role
+                    remapped.append({"role": "assistant", "content": content})
+                else:
+                    # Other assistant's message → user role with name prefix
+                    remapped.append({"role": "user", "content": f"[{other_name}]: {content}"})
+            elif role == "user":
+                remapped.append({"role": "user", "content": f"[{self.user_name}]: {content}"})
+            else:
+                remapped.append(msg)
+
+        # Merge consecutive same-role messages (required by Anthropic API)
+        return self._merge_consecutive(remapped)
+
+    @staticmethod
+    def _merge_consecutive(messages: list[dict]) -> list[dict]:
+        """Merge consecutive messages with the same role."""
+        if not messages:
+            return []
+        merged: list[dict] = [messages[0].copy()]
+        for msg in messages[1:]:
+            if msg["role"] == merged[-1]["role"] and msg["role"] != "system":
+                merged[-1]["content"] += "\n" + msg["content"]
+            else:
+                merged.append(msg.copy())
+        return merged
+
+    def save_message(
+        self, role: str, content: str, emotion: str | None = None, assistant_id: str | None = None
+    ) -> None:
         """Persist a message to the database."""
-        self.db.insert_message(self.session_id, role, content, emotion)
+        self.db.insert_message(self.session_id, role, content, emotion, assistant_id)
 
     async def extract_facts_realtime(self, user_msg: str, assistant_msg: str) -> None:
         """Extract facts from a single exchange in real-time (background task).

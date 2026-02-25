@@ -25,10 +25,11 @@ class AudioPlayer:
 
     def __init__(self, avatar_queue: queue.Queue | None = None):
         self.avatar_queue = avatar_queue
-        self.audio_queue: queue.Queue[str | None] = queue.Queue()
+        self.audio_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self.amplitude_data: list[float] = []
         self.start_time: int = 0
         self.playing = False
+        self.current_speaker: str = "eigy"
         self.volume = 1.0
         self._mixer_initialized = False
 
@@ -47,15 +48,17 @@ class AudioPlayer:
             except Exception as e:
                 logger.warning("Failed to initialize pygame.mixer: %s", e)
 
-    def enqueue(self, audio_path: str) -> None:
+    def enqueue(self, audio_path: str, speaker: str = "eigy") -> None:
         """Add an audio file to the playback queue."""
-        self.audio_queue.put(audio_path)
+        self.audio_queue.put((audio_path, speaker))
 
-    def play(self, audio_path: str) -> None:
+    def play(self, audio_path: str, speaker: str = "eigy") -> None:
         """Play an audio file and extract amplitude data for lip sync."""
         self._ensure_mixer()
         if not self._mixer_initialized:
             return
+
+        self.current_speaker = speaker
 
         # Extract amplitude envelope (optional — needs pydub + ffmpeg)
         self.amplitude_data = []
@@ -87,7 +90,7 @@ class AudioPlayer:
             self.playing = True
 
             if self.avatar_queue:
-                self.avatar_queue.put({"type": "audio_start"})
+                self.avatar_queue.put({"type": "audio_start", "target": speaker})
         except Exception as e:
             logger.warning("Failed to play audio %s: %s", audio_path, e)
             self.playing = False
@@ -117,6 +120,7 @@ class AudioPlayer:
                 self.avatar_queue.put({
                     "type": "audio_amplitude",
                     "value": max(0.0, min(1.0, amp)),
+                    "target": self.current_speaker,
                 })
 
         elif self.playing and not pygame.mixer.music.get_busy():
@@ -124,27 +128,31 @@ class AudioPlayer:
             self.playing = False
             self.amplitude_data = []
             if self.avatar_queue:
-                self.avatar_queue.put({"type": "audio_amplitude", "value": 0.0})
+                self.avatar_queue.put({
+                    "type": "audio_amplitude",
+                    "value": 0.0,
+                    "target": self.current_speaker,
+                })
 
             # Play next in queue
             if not self.audio_queue.empty():
                 try:
-                    next_path = self.audio_queue.get_nowait()
-                    if next_path:
-                        self.play(next_path)
+                    item = self.audio_queue.get_nowait()
+                    if item:
+                        self.play(item[0], item[1])
                 except queue.Empty:
                     pass
             else:
                 if self.avatar_queue:
-                    self.avatar_queue.put({"type": "audio_end"})
+                    self.avatar_queue.put({"type": "audio_end", "target": self.current_speaker})
 
         elif not self.playing:
             # Not playing, check queue
             if not self.audio_queue.empty():
                 try:
-                    next_path = self.audio_queue.get_nowait()
-                    if next_path:
-                        self.play(next_path)
+                    item = self.audio_queue.get_nowait()
+                    if item:
+                        self.play(item[0], item[1])
                 except queue.Empty:
                     pass
 

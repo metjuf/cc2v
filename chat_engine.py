@@ -17,8 +17,17 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_messages(messages: list[dict]) -> list[dict]:
+    """Strip non-standard keys from message dicts before sending to API.
+
+    Only 'role' and 'content' are valid for Anthropic/OpenRouter APIs.
+    """
+    return [{"role": m["role"], "content": m["content"]} for m in messages]
+
+
 async def stream_anthropic(
-    messages: list[dict], model: str | None = None, api_key: str | None = None
+    messages: list[dict], model: str | None = None, api_key: str | None = None,
+    max_tokens: int = 4096,
 ) -> AsyncGenerator[str, None]:
     """Stream response from Anthropic Messages API.
 
@@ -28,15 +37,18 @@ async def stream_anthropic(
     api_key = api_key or config.ANTHROPIC_API_KEY
     model = model or config.ANTHROPIC_MODEL
 
+    # Sanitize: only keep role + content (strip assistant_id etc.)
+    clean = _sanitize_messages(messages)
+
     # Separate system messages from conversation
     system_content = "\n\n".join(
-        m["content"] for m in messages if m["role"] == "system"
+        m["content"] for m in clean if m["role"] == "system"
     )
-    conversation = [m for m in messages if m["role"] != "system"]
+    conversation = [m for m in clean if m["role"] != "system"]
 
     body: dict = {
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "messages": conversation,
         "stream": True,
     }
@@ -73,11 +85,15 @@ async def stream_anthropic(
 
 
 async def stream_openrouter(
-    messages: list[dict], model: str | None = None, api_key: str | None = None
+    messages: list[dict], model: str | None = None, api_key: str | None = None,
+    max_tokens: int = 4096,
 ) -> AsyncGenerator[str, None]:
     """Stream response from OpenRouter (OpenAI-compatible API)."""
     api_key = api_key or config.OPENROUTER_API_KEY
     model = model or config.OPENROUTER_MODEL
+
+    # Sanitize messages
+    clean = _sanitize_messages(messages)
 
     async with httpx.AsyncClient() as client:
         async with client.stream(
@@ -90,7 +106,8 @@ async def stream_openrouter(
             },
             json={
                 "model": model,
-                "messages": messages,
+                "messages": clean,
+                "max_tokens": max_tokens,
                 "stream": True,
             },
             timeout=60.0,
@@ -114,7 +131,9 @@ async def stream_openrouter(
                     yield delta["content"]
 
 
-async def get_response(messages: list[dict]) -> AsyncGenerator[str, None]:
+async def get_response(
+    messages: list[dict], max_tokens: int = 4096,
+) -> AsyncGenerator[str, None]:
     """Unified streaming response with automatic failover.
 
     1. Try Anthropic API (if key configured)
@@ -124,7 +143,7 @@ async def get_response(messages: list[dict]) -> AsyncGenerator[str, None]:
     # Try Anthropic first
     if config.ANTHROPIC_API_KEY:
         try:
-            async for token in stream_anthropic(messages):
+            async for token in stream_anthropic(messages, max_tokens=max_tokens):
                 yield token
             return
         except Exception as e:
@@ -133,7 +152,7 @@ async def get_response(messages: list[dict]) -> AsyncGenerator[str, None]:
     # Fallback to OpenRouter
     if config.OPENROUTER_API_KEY:
         try:
-            async for token in stream_openrouter(messages):
+            async for token in stream_openrouter(messages, max_tokens=max_tokens):
                 yield token
             return
         except Exception as e:

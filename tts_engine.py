@@ -85,9 +85,12 @@ def clean_for_tts(text: str) -> str:
 class TTSEngine:
     """Text-to-speech with OpenAI TTS HD primary and edge-tts fallback."""
 
-    def __init__(self):
+    def __init__(self, assistant_id: str = "eigy"):
+        self.assistant_id = assistant_id
         self.enabled = config.TTS_ENABLED
-        self.voice = config.TTS_VOICE
+        # Per-assistant voice from ASSISTANTS config
+        assistant_cfg = config.ASSISTANTS.get(assistant_id, {})
+        self.voice = assistant_cfg.get("tts_voice", config.TTS_VOICE)
         self.provider = self._select_provider()
 
     def _select_provider(self) -> str:

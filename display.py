@@ -1,6 +1,7 @@
 """Eigy AI Assistant — Terminal display module.
 
 Rich-formatted output and prompt_toolkit input.
+Supports dual assistants with per-assistant colors.
 """
 
 from __future__ import annotations
@@ -32,19 +33,31 @@ def _get_prompt_session() -> PromptSession:
     return _prompt_session
 
 
-# ── Output ─────────────────────────────────────────────────────────
+# ── Per-assistant styling ──────────────────────────────────────────
 
-_NAME = config.ASSISTANT_NAME
+
+def _assistant_color(assistant_id: str) -> str:
+    """Get Rich color for a given assistant."""
+    return config.ASSISTANTS.get(assistant_id, {}).get("color", "cyan")
+
+
+def _assistant_name(assistant_id: str) -> str:
+    """Get display name for a given assistant."""
+    return config.ASSISTANTS.get(assistant_id, {}).get("name", "Assistant")
+
+
+# ── Output ─────────────────────────────────────────────────────────
 
 
 def show_welcome_banner() -> None:
     """Display the welcome panel on first launch."""
     panel = Panel(
         Text.from_markup(
-            f"[bold cyan]{_NAME} — osobní AI asistentka.\n"
-            "K vašim službám.[/bold cyan]"
+            "[bold cyan]Eigy[/bold cyan] & [bold magenta]Delan[/bold magenta]"
+            " — osobní AI asistenti.\n"
+            "[bold white]K vašim službám.[/bold white]"
         ),
-        title=f"[bold white]{_NAME}[/bold white]",
+        title="[bold white]Eigy & Delan[/bold white]",
         border_style="cyan",
         padding=(1, 2),
     )
@@ -52,12 +65,13 @@ def show_welcome_banner() -> None:
     console.print()
 
 
-def show_assistant(text: str) -> None:
+def show_assistant(text: str, assistant_id: str = "eigy") -> None:
     """Display an assistant message (non-streaming)."""
-    console.print(Text(f"{_NAME} > ", style="bold cyan"), end="")
+    name = _assistant_name(assistant_id)
+    color = _assistant_color(assistant_id)
+    console.print(Text(f"{name} > ", style=f"bold {color}"), end="")
     console.print(Markdown(text))
     console.print()
-
 
 
 def show_user(text: str) -> None:
@@ -84,11 +98,14 @@ def show_error(text: str) -> None:
 class StreamingDisplay:
     """Manages streaming token-by-token display of assistant's response."""
 
-    def __init__(self):
+    def __init__(self, assistant_id: str = "eigy"):
         self._started = False
+        self._assistant_id = assistant_id
 
     def start(self) -> None:
-        console.print(Text(f"{_NAME} > ", style="bold cyan"), end="")
+        name = _assistant_name(self._assistant_id)
+        color = _assistant_color(self._assistant_id)
+        console.print(Text(f"{name} > ", style=f"bold {color}"), end="")
         self._started = True
 
     def token(self, text: str) -> None:
@@ -106,9 +123,11 @@ class StreamingDisplay:
 # ── Spinner ────────────────────────────────────────────────────────
 
 
-def show_thinking() -> None:
+def show_thinking(assistant_id: str = "eigy") -> None:
     """Show a thinking indicator."""
-    console.print(Text(f"  {_NAME} přemýšlí...", style="dim cyan"))
+    name = _assistant_name(assistant_id)
+    color = _assistant_color(assistant_id)
+    console.print(Text(f"  {name} přemýšlí...", style=f"dim {color}"))
 
 
 # ── Input ──────────────────────────────────────────────────────────
@@ -124,7 +143,7 @@ async def get_user_input() -> str | None:
         loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(
             None,
-            partial(session.prompt, HTML("<ansigreen><b>Ty &gt; </b></ansigreen>")),
+            partial(session.prompt, HTML("<ansigreen><b>ED &gt; </b></ansigreen>")),
         )
         return text.strip()
     except EOFError:
@@ -138,11 +157,17 @@ async def get_user_input() -> str | None:
 
 def show_help() -> None:
     """Show available commands."""
-    table = Table(title=f"{_NAME} — Příkazy", border_style="cyan")
+    table = Table(title="Eigy & Delan — Příkazy", border_style="cyan")
     table.add_column("Příkaz", style="bold cyan")
     table.add_column("Popis", style="white")
 
     commands = [
+        ("ED zpráva", "Zpráva pro oba asistenty (výchozí)"),
+        ("E zpráva", "Zpráva jen pro Eigy"),
+        ("D zpráva", "Zpráva jen pro Delana"),
+        ("discussion mode [téma]", "Eigy & Delan si začnou povídat"),
+        ("end discussion mode", "Ukončit diskuzní mód"),
+        ("", ""),
         ("/voice on/off", "Zapnout/vypnout hlas"),
         ("/voice [jméno]", "Přepnout TTS hlas"),
         ("/volume [0-100]", "Nastavit hlasitost"),
