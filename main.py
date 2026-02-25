@@ -28,6 +28,7 @@ from web_search import (
 )
 from tts_engine import TTSEngine, SentenceBuffer, cleanup_temp_files
 from audio_player import AudioPlayer
+from imessage_bot import MessagesDB, IMessage, send_imessage, ContactBook
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -291,6 +292,198 @@ async def handle_command(
     return True
 
 
+# ── iMessage integration ──────────────────────────────────────────
+
+_IMESSAGE_SHOW_RE = re.compile(
+    r"^zobraz\s+imessage(?:\s+(\d+))?$", re.IGNORECASE
+)
+_IMESSAGE_REPLY_RE = re.compile(
+    r"^odep(?:is|iš)\s+na\s+imessage\s+(\d+)$", re.IGNORECASE
+)
+_IMESSAGE_SAVE_RE = re.compile(
+    r"^ulo[žz]\s+kontakt\s+(\d+)\s+(.+)$", re.IGNORECASE
+)
+_IMESSAGE_CONTACTS_RE = re.compile(
+    r"^kontakty?$", re.IGNORECASE
+)
+
+
+def detect_imessage_command(text: str) -> tuple[str, str] | None:
+    """Detect iMessage command in user input. Returns (cmd, arg) or None."""
+    text = text.strip()
+
+    m = _IMESSAGE_SHOW_RE.match(text)
+    if m:
+        return ("zobraz", m.group(1) or "5")
+
+    m = _IMESSAGE_REPLY_RE.match(text)
+    if m:
+        return ("reply", m.group(1))
+
+    m = _IMESSAGE_SAVE_RE.match(text)
+    if m:
+        return ("save_contact", f"{m.group(1)} {m.group(2)}")
+
+    if _IMESSAGE_CONTACTS_RE.match(text):
+        return ("list_contacts", "")
+
+    return None
+
+
+async def handle_imessage_command(
+    cmd: str,
+    arg: str,
+    imessage_db: MessagesDB | None,
+    imessage_cache: list[IMessage],
+    contacts: ContactBook,
+) -> tuple[MessagesDB | None, list[IMessage], bool]:
+    """Handle iMessage command. Returns (db, cache, handled)."""
+    from pathlib import Path
+
+    # Contact listing doesn't need DB
+    if cmd == "list_contacts":
+        all_c = contacts.all_contacts()
+        if not all_c:
+            display.show_system("Žádné uložené kontakty.")
+        else:
+            display.show_system("Uložené kontakty:")
+            for phone, name in all_c.items():
+                display.show_system(f"  {name} ({phone})")
+        return imessage_db, imessage_cache, True
+
+    # Save contact uses cache but not DB
+    if cmd == "save_contact":
+        parts = arg.split(maxsplit=1)
+        if len(parts) < 2:
+            display.show_system("Použití: ulož kontakt X Jméno")
+            return imessage_db, imessage_cache, True
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            display.show_system(f"Neplatné číslo: {parts[0]}")
+            return imessage_db, imessage_cache, True
+        if not imessage_cache or idx < 1 or idx > len(imessage_cache):
+            display.show_system('Nejdřív "zobraz imessage", pak ulož kontakt.')
+            return imessage_db, imessage_cache, True
+        target = imessage_cache[idx - 1]
+        name = parts[1].strip()
+        contacts.set_contact(target.sender, name)
+        display.show_system(f"Uloženo: {target.sender} → {name}")
+        return imessage_db, imessage_cache, True
+
+    # Lazy-init DB on first use
+    if imessage_db is None:
+        db_path = Path.home() / "Library" / "Messages" / "chat.db"
+        if not db_path.exists():
+            display.show_system("Chyba: Databáze iMessage nenalezena.")
+            return None, imessage_cache, True
+        try:
+            imessage_db = MessagesDB(db_path)
+        except Exception as e:
+            display.show_system(
+                f"Chyba: Nelze otevřít iMessage DB: {e}\n"
+                "  Zkontroluj Full Disk Access pro Terminal."
+            )
+            return None, imessage_cache, True
+
+    if cmd == "zobraz":
+        count = max(1, min(int(arg), 50))
+        messages = imessage_db.get_recent_incoming(count)
+        if not messages:
+            display.show_system("Žádné příchozí zprávy.")
+        else:
+            imessage_cache.clear()
+            imessage_cache.extend(messages)
+            display.show_system(f"Posledních {len(messages)} iMessage zpráv:")
+            for i, msg in enumerate(messages, 1):
+                ts = msg.timestamp.strftime("%d.%m. %H:%M")
+                name = contacts.get_name(msg.sender)
+                display.show_system(f"  [{i}] {name} ({ts})")
+                display.show_system(f"      {msg.text}")
+        return imessage_db, imessage_cache, True
+
+    if cmd == "reply":
+        num = int(arg)
+        if not imessage_cache:
+            display.show_system('Nejdřív napiš "zobraz imessage" pro načtení zpráv.')
+            return imessage_db, imessage_cache, True
+        if num < 1 or num > len(imessage_cache):
+            display.show_system(f"Neplatné číslo. Zadej 1–{len(imessage_cache)}.")
+            return imessage_db, imessage_cache, True
+
+        msg = imessage_cache[num - 1]
+        ts = msg.timestamp.strftime("%d.%m. %H:%M")
+        name = contacts.get_name(msg.sender)
+        display.show_system(f"Odpovědět na zprávu od {name} ({ts}):")
+        display.show_system(f"  \"{msg.text}\"")
+        display.show_system("Napiš odpověď (nebo prázdný řádek pro zrušení):")
+
+        reply_text = await display.get_user_input()
+        if not reply_text:
+            display.show_system("Zrušeno.")
+            return imessage_db, imessage_cache, True
+
+        display.show_system(f'Odeslat "{reply_text}" → {name}? (a/n)')
+        confirm = await display.get_user_input()
+        if confirm and confirm.lower() in ("a", "ano", "y", "yes"):
+            display.show_system("Odesílám...")
+            if send_imessage(msg.sender, reply_text):
+                display.show_system("Zpráva odeslána!")
+            else:
+                display.show_system("Chyba: Odeslání selhalo. Zkontroluj Messages.app.")
+        else:
+            display.show_system("Zrušeno.")
+
+        return imessage_db, imessage_cache, True
+
+    return imessage_db, imessage_cache, False
+
+
+# ── iMessage async watcher ───────────────────────────────────────
+
+_IMESSAGE_WATCH_INTERVAL = 5  # seconds
+
+
+async def _imessage_watcher(
+    event_queue: asyncio.Queue,
+    imessage_db_holder: list,
+) -> None:
+    """Async background task: polls iMessage DB for new messages.
+
+    Pushes {"type": "imessage_new", "messages": [...]} events.
+    imessage_db_holder is a 1-element list so we can lazy-init and share.
+    """
+    from pathlib import Path
+
+    db_path = Path.home() / "Library" / "Messages" / "chat.db"
+    if not db_path.exists():
+        return
+
+    # Try to open DB
+    try:
+        watcher_db = MessagesDB(db_path)
+    except Exception:
+        return
+
+    last_rowid = watcher_db.get_latest_rowid()
+    # Share DB instance so zobraz/reply can reuse it
+    if not imessage_db_holder[0]:
+        imessage_db_holder[0] = watcher_db
+
+    while True:
+        await asyncio.sleep(_IMESSAGE_WATCH_INTERVAL)
+        try:
+            new_msgs = watcher_db.get_messages_since(last_rowid)
+            for msg in new_msgs:
+                last_rowid = max(last_rowid, msg.rowid)
+                await event_queue.put({
+                    "type": "imessage_new",
+                    "message": msg,
+                })
+        except Exception as e:
+            logger.warning("iMessage watcher error: %s", e)
+
+
 # ── Input/event race ──────────────────────────────────────────────
 
 
@@ -419,6 +612,11 @@ async def chat_loop(
     """Main chat loop — input, stream response, display, TTS, avatar events."""
     current_messages: list[dict] = []
 
+    # iMessage integration state (lazy-initialized on first use)
+    imessage_db_holder: list = [None]  # mutable holder for lazy-init sharing
+    imessage_cache: list[IMessage] = []
+    imessage_contacts = ContactBook()
+
     # Initialize timer manager and idle monitor
     event_queue: asyncio.Queue = asyncio.Queue()
     timer_mgr = TimerManager(event_queue)
@@ -426,6 +624,11 @@ async def chat_loop(
 
     # Start idle monitor background task
     idle_task = asyncio.create_task(idle_monitor.run())
+
+    # Start iMessage watcher (pushes imessage_new events to queue)
+    imessage_watcher_task = asyncio.create_task(
+        _imessage_watcher(event_queue, imessage_db_holder)
+    )
 
     # Greeting for returning users
     if memory.user_name not in ("friend", "šéfe"):
@@ -473,6 +676,16 @@ async def chat_loop(
                     await handle_command(
                         user_input, memory, db, tts, audio_player,
                         avatar_queue, timer_mgr,
+                    )
+                    continue
+
+                # iMessage commands (zobraz imessage, odepiš na imessage, kontakty)
+                imsg_cmd = detect_imessage_command(user_input)
+                if imsg_cmd:
+                    imessage_db_holder[0], imessage_cache, _ = await handle_imessage_command(
+                        imsg_cmd[0], imsg_cmd[1],
+                        imessage_db_holder[0], imessage_cache,
+                        imessage_contacts,
                     )
                     continue
 
@@ -635,13 +848,33 @@ async def chat_loop(
                     avatar_queue, current_messages,
                 )
 
+            elif action_type == "imessage_new":
+                # New iMessage arrived — display and read aloud
+                msg = payload.get("message")
+                if msg:
+                    name = imessage_contacts.get_name(msg.sender)
+                    notification = f"Nová zpráva od {name}: {msg.text}"
+                    display.show_system(f"  iMessage od {name}: {msg.text}")
+                    idle_monitor.reset()
+                    await proactive_response(
+                        notification, memory, tts, audio_player,
+                        avatar_queue, current_messages,
+                    )
+
     finally:
         # Cleanup
         idle_monitor.stop()
         timer_mgr.cancel_all()
         idle_task.cancel()
+        imessage_watcher_task.cancel()
+        if imessage_db_holder[0] is not None:
+            imessage_db_holder[0].close()
         try:
             await idle_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await imessage_watcher_task
         except asyncio.CancelledError:
             pass
 
