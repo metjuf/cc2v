@@ -112,3 +112,82 @@ async def detect_emotion_llm(text: str) -> str:
         logger.debug("LLM emotion detection failed: %s", e)
 
     return detect_emotion(text)
+
+
+# ── User Mood Detection ──────────────────────────────────────────
+
+_USER_MOOD_PATTERNS: dict[str, list[str]] = {
+    "happy": [
+        r"\b(super|paráda|skvělé|výborně|fajn|hurá|juchů)\b",
+        r"\b(díky|děkuj|děkuju)\b", r"[!]{2,}",
+    ],
+    "frustrated": [
+        r"\b(nefunguje|nechce|nejde|problém|chyba|kurva|sakra|do prdele)\b",
+        r"\b(zase|pořád|stále|furt)\b",
+    ],
+    "sad": [
+        r"\b(smutný|smutná|smutné|špatně|blbě|hrozně|mizerně)\b",
+        r"\b(nebaví|nechce se mi|nemám náladu)\b",
+    ],
+    "curious": [
+        r"\b(jak|proč|co|kdy|kde|zajímá|zajímavé)\b.*\?",
+        r"\b(vysvětli|popiš|řekni)\b",
+    ],
+    "stressed": [
+        r"\b(nestíhám|spěchám|deadline|termín|musím)\b",
+        r"\b(stres|nervozní|nervózní|úzkost)\b",
+    ],
+    "excited": [
+        r"\b(hele|ty jo|nemůžu uvěřit|úžasné|fantazie)\b",
+        r"\b(právě jsem|konečně|povedlo se)\b",
+    ],
+    "neutral": [],
+}
+
+
+def detect_user_mood(text: str) -> str:
+    """Detect mood from USER message using keyword matching.
+
+    Returns one of: neutral, happy, frustrated, sad, curious, stressed, excited.
+    """
+    text_lower = text.lower()
+    scores: dict[str, int] = {mood: 0 for mood in _USER_MOOD_PATTERNS}
+
+    for mood, patterns in _USER_MOOD_PATTERNS.items():
+        for pattern in patterns:
+            matches = re.findall(pattern, text_lower)
+            scores[mood] += len(matches)
+
+    best = max(scores, key=scores.get)
+    if scores[best] == 0:
+        return "neutral"
+    return best
+
+
+async def detect_user_mood_llm(text: str) -> str:
+    """Detect user mood via LLM. Falls back to keyword detection."""
+    try:
+        import chat_engine
+
+        prompt_messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Zklasifikuj náladu uživatele z této zprávy. "
+                    "Vyber PŘESNĚ jedno z: neutral, happy, frustrated, sad, "
+                    "curious, stressed, excited.\n\n"
+                    f"Zpráva: {text[:500]}\n\n"
+                    "Vrať POUZE jedno slovo."
+                ),
+            }
+        ]
+        result = await chat_engine.get_auxiliary_response(prompt_messages)
+        mood = result.strip().lower()
+        valid = ("neutral", "happy", "frustrated", "sad",
+                 "curious", "stressed", "excited")
+        if mood in valid:
+            return mood
+    except Exception as e:
+        logger.debug("LLM user mood detection failed: %s", e)
+
+    return detect_user_mood(text)

@@ -30,7 +30,7 @@ async def stream_anthropic(
 
     # Separate system messages from conversation
     system_content = "\n\n".join(
-        m["content"] for m in messages if m["role"] == "system"
+        str(m["content"]) for m in messages if m["role"] == "system"
     )
     conversation = [m for m in messages if m["role"] != "system"]
 
@@ -172,6 +172,45 @@ async def get_auxiliary_response(
             json={
                 "model": model,
                 "messages": messages,
+            },
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+
+async def get_auxiliary_json_response(
+    messages: list[dict], model: str | None = None
+) -> str:
+    """Non-streaming response with JSON mode enforced.
+
+    Same as get_auxiliary_response but adds response_format for OpenRouter.
+    Anthropic fallback uses plain text (no native JSON mode).
+    """
+    model = model or config.AUX_MODEL
+
+    if not config.OPENROUTER_API_KEY:
+        # Fall back to Anthropic (no JSON mode — relies on prompt)
+        if config.ANTHROPIC_API_KEY:
+            result = []
+            async for token in stream_anthropic(messages, model=config.ANTHROPIC_MODEL):
+                result.append(token)
+            return "".join(result)
+        return ""
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/eigy-ai",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
             },
             timeout=30.0,
         )

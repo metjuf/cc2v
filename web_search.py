@@ -21,13 +21,28 @@ from ddgs import DDGS
 logger = logging.getLogger(__name__)
 
 # Max chars of page content to extract per result
-_MAX_PAGE_CONTENT = 1500
+_MAX_PAGE_CONTENT = 3000
 # How many top results to fetch full content for
-_FETCH_TOP_N = 3
+_FETCH_TOP_N = 5
 # Timeout for page fetch (seconds)
-_FETCH_TIMEOUT = 5.0
+_FETCH_TIMEOUT = 8.0
+# Max retries for page fetch
+_FETCH_RETRIES = 2
 # Skip URLs matching these patterns (binary/non-text content)
 _SKIP_URL_RE = re.compile(r"\.(pdf|jpg|jpeg|png|gif|mp4|mp3|zip|rar|exe)$", re.IGNORECASE)
+# Max results from same domain
+_MAX_PER_DOMAIN = 2
+# Realistic browser User-Agent
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept-Language": "cs,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 
 # ── False-positive exclusions ─────────────────────────────────────
@@ -279,6 +294,13 @@ def format_crypto_price(coin_id: str, data: dict) -> str:
 # ── Page content extraction ───────────────────────────────────────
 
 
+_NOISE_CLASSES = re.compile(
+    r"sidebar|menu|comment|advertisement|cookie|social|share|related|"
+    r"footer|header|nav|popup|modal|banner|widget|ad-|promo",
+    re.IGNORECASE,
+)
+
+
 def _extract_text_from_html(raw_html: str) -> str:
     """Extract clean text content from HTML using lxml."""
     try:
@@ -286,49 +308,120 @@ def _extract_text_from_html(raw_html: str) -> str:
     except Exception:
         return ""
 
-    # Remove script, style, nav, footer, header, aside elements
-    for tag in doc.iter("script", "style", "nav", "footer", "header", "aside", "noscript"):
-        tag.getparent().remove(tag)
+    # Remove unwanted tags
+    for tag in doc.iter(
+        "script", "style", "nav", "footer", "header", "aside",
+        "noscript", "iframe", "svg", "form", "button",
+    ):
+        parent = tag.getparent()
+        if parent is not None:
+            parent.remove(tag)
 
-    # Try to find main content area first
-    main = doc.find(".//main")
-    if main is None:
-        main = doc.find(".//article")
-    if main is not None:
-        text = main.text_content()
+    # Remove elements with noisy CSS classes via XPath
+    try:
+        for el in doc.xpath("//*[@class]"):
+            cls = el.get("class", "")
+            if _NOISE_CLASSES.search(cls):
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+    except Exception:
+        pass
+
+    # Try priority content selectors
+    content_el = None
+    for selector in (".//main", ".//article"):
+        content_el = doc.find(selector)
+        if content_el is not None:
+            break
+
+    # Try class-based content selectors
+    if content_el is None:
+        try:
+            for el in doc.xpath("//*[contains(@class, 'content') or contains(@class, 'post') or contains(@class, 'entry')]"):
+                if len(el.text_content()) > 200:
+                    content_el = el
+                    break
+        except Exception:
+            pass
+
+    if content_el is not None:
+        text = content_el.text_content()
     else:
         body = doc.find(".//body")
         text = body.text_content() if body is not None else doc.text_content()
 
-    # Clean up whitespace
-    lines = [line.strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
+    # Clean up whitespace, skip very short lines, deduplicate consecutive
+    lines = []
+    prev_line = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if len(line) < 4:
+            continue
+        if line == prev_line:
+            continue
+        lines.append(line)
+        prev_line = line
+
     return "\n".join(lines)
 
 
+def _truncate_at_sentence(text: str, max_len: int) -> str:
+    """Truncate text at the nearest sentence boundary before max_len."""
+    if len(text) <= max_len:
+        return text
+    # Search backwards for sentence-ending punctuation followed by whitespace
+    chunk = text[:max_len]
+    for i in range(len(chunk) - 1, max(0, len(chunk) - 300), -1):
+        if chunk[i] in ".!?" and (i + 1 >= len(chunk) or chunk[i + 1].isspace()):
+            return chunk[:i + 1]
+    # Fallback: truncate at last space
+    last_space = chunk.rfind(" ", max(0, len(chunk) - 200))
+    if last_space > 0:
+        return chunk[:last_space] + "..."
+    return chunk
+
+
 async def _fetch_page_content(url: str) -> str:
-    """Fetch and extract text content from a URL."""
+    """Fetch and extract text content from a URL. Retries on timeout."""
     if _SKIP_URL_RE.search(url):
         return ""
 
-    try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=_FETCH_TIMEOUT,
-        ) as client:
-            resp = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; EigyBot/1.0)"},
-            )
-            if resp.status_code != 200:
-                return ""
-            content_type = resp.headers.get("content-type", "")
-            if "text/html" not in content_type:
-                return ""
-            text = _extract_text_from_html(resp.text)
-            return text[:_MAX_PAGE_CONTENT]
-    except Exception:
-        return ""
+    for attempt in range(_FETCH_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=_FETCH_TIMEOUT,
+            ) as client:
+                resp = await client.get(url, headers=_HEADERS)
+                if resp.status_code != 200:
+                    return ""
+                content_type = resp.headers.get("content-type", "")
+                if "text/html" not in content_type:
+                    return ""
+                text = _extract_text_from_html(resp.text)
+                return _truncate_at_sentence(text, _MAX_PAGE_CONTENT)
+        except (httpx.TimeoutException, httpx.ConnectError):
+            if attempt < _FETCH_RETRIES:
+                await asyncio.sleep(0.5)
+                continue
+            return ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _deduplicate_by_domain(results: list[dict]) -> list[dict]:
+    """Limit results to max N per domain for diversity."""
+    domain_count: dict[str, int] = {}
+    filtered = []
+    for r in results:
+        domain = _short_source(r.get("url", ""))
+        count = domain_count.get(domain, 0)
+        if count < _MAX_PER_DOMAIN:
+            filtered.append(r)
+            domain_count[domain] = count + 1
+    return filtered
 
 
 async def _enrich_results(results: list[dict]) -> list[dict]:
@@ -347,7 +440,7 @@ async def _enrich_results(results: list[dict]) -> list[dict]:
 # ── DuckDuckGo search ─────────────────────────────────────────────
 
 
-def _search_sync(query: str, max_results: int = 7) -> list[dict]:
+def _search_sync(query: str, max_results: int = 10) -> list[dict]:
     """Synchronous DuckDuckGo search."""
     try:
         ddgs = DDGS()
@@ -364,16 +457,18 @@ def _search_sync(query: str, max_results: int = 7) -> list[dict]:
         return []
 
 
-async def search(query: str, max_results: int = 7) -> list[dict]:
+async def search(query: str, max_results: int = 10) -> list[dict]:
     """Search DuckDuckGo and enrich top results with page content.
 
     Automatically adds today's date for time-sensitive queries.
+    Deduplicates by domain before enrichment for diverse results.
     Returns list of {"title", "url", "snippet", "content"(optional)}.
     """
     enhanced_query = _enhance_query(query)
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(None, _search_sync, enhanced_query, max_results)
     if results:
+        results = _deduplicate_by_domain(results)
         results = await _enrich_results(results)
     return results
 

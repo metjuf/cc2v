@@ -78,6 +78,28 @@ def show_error(text: str) -> None:
     console.print()
 
 
+# ── Debug output ──────────────────────────────────────────────────
+
+_debug_enabled = False
+
+
+def set_debug(enabled: bool) -> None:
+    """Toggle debug output."""
+    global _debug_enabled
+    _debug_enabled = enabled
+
+
+def is_debug() -> bool:
+    """Check if debug output is enabled."""
+    return _debug_enabled
+
+
+def show_debug(msg: str) -> None:
+    """Display a debug message (only when debug is enabled)."""
+    if _debug_enabled:
+        console.print(Text(f"  [dbg] {msg}", style="dim white"))
+
+
 # ── Streaming output ───────────────────────────────────────────────
 
 
@@ -143,19 +165,11 @@ def show_help() -> None:
     table.add_column("Popis", style="white")
 
     commands = [
-        ("/voice on/off", "Zapnout/vypnout hlas"),
-        ("/voice [jméno]", "Přepnout TTS hlas"),
-        ("/volume [0-100]", "Nastavit hlasitost"),
-        ("/avatar", "Přepnout okno avatara"),
-        ("/emotion [emoce]", "Ručně nastavit emoci avatara"),
-        ("/model [název]", "Přepnout primární chat model"),
         ("/memory", "Ukázat, co si pamatuji"),
+        ("/oprav <instrukce>", "Opravit informace v profilu"),
         ("/forget", "Smazat všechny vzpomínky (s potvrzením)"),
-        ("/timer", "Zobrazit aktivní timery"),
-        ("/timer cancel [id]", "Zrušit timer"),
         ("/history", "Zobrazit historii aktuální relace"),
-        ("/export", "Exportovat vše do JSON"),
-        ("/help", "Zobrazit tuto nápovědu"),
+        ("/debug", "Zapnout/vypnout debug výpisy"),
         ("", ""),
         ("zobraz imessage [N]", "Zobrazit příchozí iMessage zprávy"),
         ("odepiš na imessage X", "Odpovědět na iMessage zprávu"),
@@ -164,7 +178,6 @@ def show_help() -> None:
         ("", ""),
         ("\"vyhledej X\"", "Automatický web search (DuckDuckGo)"),
         ("\"cena bitcoinu\"", "Živá cena kryptoměny (CoinGecko)"),
-        ("\"stopni mi 10 minut\"", "Nastavit odpočet/timer"),
         ("exit / quit / konec", "Ukončit (automaticky uloží relaci)"),
     ]
     for cmd, desc in commands:

@@ -1,7 +1,8 @@
-"""Eigy AI Assistant — Pygame avatar window.
+"""Eigy AI Assistant — Pygame avatar window (spectrum visualizer).
 
 Runs in the MAIN thread (macOS requirement for SDL2/Pygame).
 Receives events from the chat thread via avatar_queue.
+Displays a horizontal audio spectrum instead of an animated face.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ import pygame
 
 import config
 from avatar.animator import Animator
-from avatar.face_renderer import FaceRenderer
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,15 @@ GLOW_COLORS: dict[str, tuple[int, int, int]] = {
     "thinking":  (220, 150, 50),
     "speaking":  (60, 120, 200),
 }
+
+
+# ── Spectrum constants ───────────────────────────────────────────
+
+_BAR_COUNT = 48
+_BAR_WIDTH = 4
+_BAR_GAP = 3
+_BAR_MAX_HEIGHT = 180
+_BAR_MIN_HEIGHT = 4
 
 
 # ── Particles ────────────────────────────────────────────────────
@@ -74,7 +83,6 @@ def _build_background(size: tuple[int, int]) -> pygame.Surface:
     cx, cy = w // 2, h // 2
     max_radius = int((cx**2 + cy**2) ** 0.5)
 
-    # Draw from outside-in: edge (38,38,42) → center (26,26,26)
     for r in range(max_radius, 0, -3):
         t = r / max_radius
         cr = int(26 + 12 * t)
@@ -127,14 +135,15 @@ def _get_glow_surface(
     size: tuple[int, int],
 ) -> pygame.Surface:
     """Get or build a cached glow surface for the given emotion."""
-    if emotion in _glow_cache:
-        return _glow_cache[emotion]
+    cache_key = f"{emotion}_{size[0]}_{size[1]}"
+    if cache_key in _glow_cache:
+        return _glow_cache[cache_key]
 
     color = GLOW_COLORS.get(emotion, GLOW_COLORS["neutral"])
     w, h = size
 
-    glow_w = int(w * 0.75)
-    glow_h = int(h * 0.70)
+    glow_w = int(w * 0.85)
+    glow_h = int(h * 0.50)
 
     surface = pygame.Surface((glow_w, glow_h), pygame.SRCALPHA)
     cx, cy = glow_w // 2, glow_h // 2
@@ -153,7 +162,7 @@ def _get_glow_surface(
             (cx - rx, cy - ry, rx * 2, ry * 2),
         )
 
-    _glow_cache[emotion] = surface
+    _glow_cache[cache_key] = surface
     return surface
 
 
@@ -162,21 +171,91 @@ def _draw_glow(
     size: tuple[int, int],
     emotion: str,
     breath_phase: float,
-    y_offset: float,
 ) -> None:
-    """Draw the emotion-colored glow aura behind the face."""
+    """Draw the emotion-colored glow aura behind the spectrum."""
     glow = _get_glow_surface(emotion, size)
     gw, gh = glow.get_size()
     w, h = size
 
     x = (w - gw) // 2
-    y = (h - gh) // 2 + int(y_offset)
+    y = (h - gh) // 2
 
     pulse = 0.85 + 0.15 * math.sin(breath_phase * 2 * math.pi)
 
     glow_frame = glow.copy()
     glow_frame.set_alpha(int(255 * pulse))
     screen.blit(glow_frame, (x, y))
+
+
+# ── Spectrum visualizer ──────────────────────────────────────────
+
+
+def _draw_spectrum(
+    screen: pygame.Surface,
+    size: tuple[int, int],
+    time: float,
+    state: str,
+    amplitude: float,
+    emotion: str,
+    breath_phase: float,
+) -> None:
+    """Draw the horizontal audio spectrum bars.
+
+    - Idle: minimal height, gentle sine wave (breathing)
+    - Thinking: traveling wave pattern
+    - Speaking: bars react to audio amplitude with pseudo-FFT distribution
+    Center bars are taller, edge bars shorter → abstractly resembles a mouth.
+    """
+    w, h = size
+    color = GLOW_COLORS.get(emotion, GLOW_COLORS["neutral"])
+
+    total_width = _BAR_COUNT * _BAR_WIDTH + (_BAR_COUNT - 1) * _BAR_GAP
+    start_x = (w - total_width) // 2
+    center_y = h // 2
+
+    for i in range(_BAR_COUNT):
+        # Center factor: bars in the center are taller (0.0 at edges, 1.0 at center)
+        t = i / (_BAR_COUNT - 1)  # 0..1
+        center_factor = 1.0 - abs(t - 0.5) * 2.0  # 0 at edges, 1 at center
+        center_factor = 0.3 + 0.7 * center_factor  # remap to 0.3..1.0
+
+        if state == "speaking":
+            # Pseudo-FFT: multiple sine waves per bar driven by amplitude
+            s1 = math.sin(time * 5.0 + i * 0.4) * 0.5 + 0.5
+            s2 = math.sin(time * 8.3 + i * 0.7) * 0.3 + 0.5
+            s3 = math.sin(time * 12.1 + i * 1.1) * 0.2 + 0.5
+            wave = (s1 + s2 + s3) / 3.0
+            bar_h = _BAR_MIN_HEIGHT + (_BAR_MAX_HEIGHT - _BAR_MIN_HEIGHT) * amplitude * center_factor * wave
+        elif state == "thinking":
+            # Traveling wave
+            wave = math.sin(time * 2.5 - i * 0.25) * 0.5 + 0.5
+            bar_h = _BAR_MIN_HEIGHT + 40 * center_factor * wave
+        else:
+            # Idle: gentle breathing wave
+            wave = math.sin(breath_phase * 2 * math.pi + i * 0.15) * 0.5 + 0.5
+            bar_h = _BAR_MIN_HEIGHT + 8 * center_factor * wave
+
+        bar_h = max(_BAR_MIN_HEIGHT, int(bar_h))
+        x = start_x + i * (_BAR_WIDTH + _BAR_GAP)
+        y = center_y - bar_h // 2
+
+        # Per-bar color: brighter in center
+        brightness = 0.6 + 0.4 * center_factor
+        r = min(255, int(color[0] * brightness))
+        g = min(255, int(color[1] * brightness))
+        b = min(255, int(color[2] * brightness))
+
+        # Alpha: base + dynamic
+        alpha = int(140 + 115 * center_factor * (bar_h / max(_BAR_MAX_HEIGHT, 1)))
+
+        bar_surf = pygame.Surface((_BAR_WIDTH, bar_h), pygame.SRCALPHA)
+        # Gradient fill: brighter at center of bar
+        for row in range(bar_h):
+            row_t = abs(row / max(bar_h - 1, 1) - 0.5) * 2.0  # 0 at center, 1 at edges
+            row_alpha = int(alpha * (0.7 + 0.3 * (1.0 - row_t)))
+            bar_surf.fill((r, g, b, row_alpha), (0, row, _BAR_WIDTH, 1))
+
+        screen.blit(bar_surf, (x, y))
 
 
 # ── Status indicator ─────────────────────────────────────────────
@@ -187,84 +266,16 @@ def _draw_status(
     size: tuple[int, int],
     state: str,
     time: float,
-    amplitude: float,
     font: pygame.font.Font,
 ) -> None:
-    """Draw the status indicator at the bottom of the window."""
+    """Draw the assistant name at the bottom of the window."""
     w, h = size
     center_x = w // 2
-    base_y = h - 35
+    base_y = h - 25
 
-    # Name
     name_surface = font.render(config.ASSISTANT_NAME, True, (120, 120, 130))
     name_rect = name_surface.get_rect(center=(center_x, base_y))
     screen.blit(name_surface, name_rect)
-
-    # State animation
-    indicator_y = base_y + 18
-
-    if state == "thinking":
-        _draw_thinking_dots(screen, center_x, indicator_y, time)
-    elif state == "speaking":
-        _draw_sound_waves(screen, center_x, indicator_y, time, amplitude)
-
-
-def _draw_thinking_dots(
-    screen: pygame.Surface,
-    cx: int,
-    cy: int,
-    time: float,
-) -> None:
-    """Draw animated thinking dots with staggered bounce."""
-    dot_spacing = 12
-    dot_radius = 3
-
-    for i in range(3):
-        phase = (time * 2.0 - i * 0.3) % 1.0
-        bounce = max(0, math.sin(phase * math.pi)) * 6
-
-        x = cx + (i - 1) * dot_spacing
-        y = int(cy - bounce)
-
-        alpha = int(100 + 100 * (bounce / 6.0))
-
-        dot_surf = pygame.Surface((dot_radius * 2, dot_radius * 2), pygame.SRCALPHA)
-        pygame.draw.circle(
-            dot_surf, (180, 150, 60, alpha),
-            (dot_radius, dot_radius), dot_radius,
-        )
-        screen.blit(dot_surf, (x - dot_radius, y - dot_radius))
-
-
-def _draw_sound_waves(
-    screen: pygame.Surface,
-    cx: int,
-    cy: int,
-    time: float,
-    amplitude: float,
-) -> None:
-    """Draw animated sound wave bars during speaking."""
-    bar_count = 5
-    bar_width = 3
-    bar_spacing = 6
-    max_height = 12
-
-    total_width = bar_count * bar_width + (bar_count - 1) * bar_spacing
-    start_x = cx - total_width // 2
-
-    for i in range(bar_count):
-        phase = time * (3.0 + i * 0.7) + i * 0.5
-        wave = (math.sin(phase) + 1.0) / 2.0
-
-        height = max(2, int(max_height * wave * max(0.3, amplitude)))
-
-        x = start_x + i * (bar_width + bar_spacing)
-        y = cy - height // 2
-
-        alpha = int(120 + 80 * wave)
-        bar_surf = pygame.Surface((bar_width, height), pygame.SRCALPHA)
-        bar_surf.fill((80, 140, 220, alpha))
-        screen.blit(bar_surf, (x, y))
 
 
 # ── Vignette overlay (cached) ────────────────────────────────────
@@ -309,7 +320,6 @@ def avatar_main(
 
     clock = pygame.time.Clock()
     animator = Animator()
-    renderer = FaceRenderer(config.DEFAULT_FACE_DIR, size)
 
     # Status indicator font
     try:
@@ -356,16 +366,22 @@ def avatar_main(
         # 5b. Floating particles
         _update_and_draw_particles(screen, size, dt, animator.time)
 
-        # 5c. Glow aura (behind face)
+        # 5c. Glow aura (behind spectrum)
         _draw_glow(
             screen, size,
             state.get("emotion", "neutral"),
             state.get("breath_phase", 0.0),
-            state.get("y_offset", 0.0),
         )
 
-        # 5d. Face layers
-        renderer.render(screen, state)
+        # 5d. Spectrum visualizer
+        _draw_spectrum(
+            screen, size,
+            animator.time,
+            state.get("state", "idle"),
+            state.get("amplitude", 0.0),
+            state.get("emotion", "neutral"),
+            state.get("breath_phase", 0.0),
+        )
 
         # 5e. Vignette overlay
         _draw_vignette(screen, size)
@@ -375,7 +391,6 @@ def avatar_main(
             screen, size,
             state.get("state", "idle"),
             animator.time,
-            state.get("amplitude", 0.0),
             status_font,
         )
 
@@ -401,8 +416,6 @@ def _handle_event(event: dict, animator: Animator) -> bool:
         animator.set_state("speaking")
 
     elif evt_type == "speaking_end":
-        # Don't reset — audio may still be playing.
-        # audio_end will handle cleanup.
         pass
 
     elif evt_type == "audio_amplitude":

@@ -16,11 +16,14 @@ import threading
 import config
 import chat_engine
 import display
-from avatar.emotion_detector import detect_emotion, detect_emotion_llm
+from avatar.emotion_detector import (
+    detect_emotion, detect_emotion_llm,
+    detect_user_mood, detect_user_mood_llm,
+)
 from memory.database import Database
 from memory.memory_manager import MemoryManager
-from timer_manager import TimerManager, parse_timer_request
 from proactive import IdleMonitor
+from session_logger import SessionLogger
 from web_search import (
     detect_search_request, search as web_search, format_results as format_search_results,
     detect_crypto_request, fetch_crypto_price, format_crypto_price,
@@ -28,6 +31,15 @@ from web_search import (
 from tts_engine import TTSEngine, SentenceBuffer, cleanup_temp_files
 from audio_player import AudioPlayer
 from imessage_bot import MessagesDB, IMessage, send_imessage, ContactBook
+
+# Episodic memory (optional dependency)
+try:
+    from memory.episodic import EpisodicMemory, is_available as episodic_available
+except ImportError:
+    EpisodicMemory = None  # type: ignore[assignment,misc]
+
+    def episodic_available() -> bool:  # type: ignore[misc]
+        return False
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -102,9 +114,52 @@ async def chat_main(
         avatar_queue.put({"type": "quit"})
         return
 
+    # Initialize debug mode
+    display.set_debug(config.DEBUG_ENABLED)
+    _dbg = display.show_debug
+
     # Initialize database and memory
     db = Database(config.DATABASE_PATH)
-    memory = MemoryManager(db)
+
+    # Initialize episodic memory (optional — requires chromadb + sentence-transformers)
+    episodic = None
+    if config.EPISODIC_MEMORY_ENABLED and episodic_available():
+        try:
+            episodic = EpisodicMemory(config.CHROMADB_PATH, debug_callback=_dbg)
+            display.show_system(f"Epizodická paměť aktivní ({episodic.count()} vzpomínek)")
+        except Exception as e:
+            logger.warning("Failed to initialize episodic memory: %s", e)
+            display.show_system("Epizodická paměť nedostupná, pokračuji bez ní.")
+
+    memory = MemoryManager(db, episodic=episodic, debug_callback=_dbg)
+    memory.start_workers()
+
+    # Initialize session logger
+    slog = SessionLogger(
+        session_id=memory.session_id,
+        log_dir=config.LOG_DIR if config.LOG_TO_FILE else None,
+        sessions_dir=config.SESSIONS_DIR if config.LOG_TO_FILE else None,
+        enabled=config.LOG_TO_FILE,
+    )
+    slog.log_session_start(
+        user_name=memory.user_name,
+        config_snapshot={
+            "anthropic_model": config.ANTHROPIC_MODEL,
+            "aux_model": config.AUX_MODEL,
+            "tts_enabled": config.TTS_ENABLED,
+            "tts_voice": config.TTS_VOICE,
+            "emotion_detection": config.EMOTION_DETECTION,
+            "episodic_memory": config.EPISODIC_MEMORY_ENABLED,
+            "temporal_awareness": config.TEMPORAL_AWARENESS_ENABLED,
+            "emotional_adaptation": config.EMOTIONAL_ADAPTATION_ENABLED,
+            "style_variation": config.STYLE_VARIATION_ENABLED,
+            "chain_of_thought": config.CHAIN_OF_THOUGHT_ENABLED,
+            "observations": config.EIGY_OBSERVATIONS_ENABLED,
+            "intent_tagging": config.ASSISTANT_INTENT_TAGGING_ENABLED,
+            "smart_proactive": config.SMART_PROACTIVE_ENABLED,
+            "proactive_enabled": config.PROACTIVE_ENABLED,
+        },
+    )
 
     try:
         # First-run onboarding
@@ -112,7 +167,7 @@ async def chat_main(
             await first_run_onboarding(memory, tts, audio_player, avatar_queue)
 
         # Main chat loop
-        await chat_loop(db, memory, tts, audio_player, avatar_queue)
+        await chat_loop(db, memory, tts, audio_player, avatar_queue, slog)
 
         # End session
         display.show_system("Ukládám relaci...")
@@ -120,8 +175,10 @@ async def chat_main(
         display.show_system("Relace uložena. Tak zase příště.")
     except Exception as e:
         logger.error("Chat loop error: %s", e)
+        slog.log_error(str(e), "chat_main")
         display.show_error(f"Unexpected error: {e}")
     finally:
+        slog.close()
         db.close()
         cleanup_temp_files()
 
@@ -168,15 +225,23 @@ async def handle_command(
     tts: TTSEngine,
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
-    timer_mgr: TimerManager,
+    slog: SessionLogger | None = None,
 ) -> bool:
     """Handle slash commands. Returns True if handled."""
     parts = user_input.split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
+    if slog:
+        slog.log_command(cmd, arg)
+
     if cmd == "/help":
         display.show_help()
+    elif cmd == "/debug":
+        new_state = not display.is_debug()
+        display.set_debug(new_state)
+        status = "zapnutý" if new_state else "vypnutý"
+        display.show_system(f"Debug režim {status}.")
     elif cmd == "/memory":
         summary = memory.profile.get_summary()
         if summary:
@@ -195,6 +260,8 @@ async def handle_command(
         confirm = await display.get_user_input()
         if confirm and confirm.lower() in ("ano", "a", "yes", "y"):
             db.clear_all()
+            if memory.episodic:
+                memory.episodic.clear_all()
             display.show_system("Paměť vymazána. Jako bychom se nikdy nepotkali.")
             memory.user_name = "šéfe"
         else:
@@ -232,30 +299,6 @@ async def handle_command(
     elif cmd == "/avatar":
         avatar_queue.put({"type": "toggle_avatar"})
         display.show_system("Okno avatara přepnuto.")
-    elif cmd == "/timer":
-        if arg and arg.lower().startswith("cancel"):
-            cancel_parts = arg.split(maxsplit=1)
-            if len(cancel_parts) > 1:
-                tid = cancel_parts[1].strip()
-                if timer_mgr.cancel_timer(tid):
-                    display.show_system(f"Timer {tid} zrušen.")
-                else:
-                    display.show_system(f"Timer {tid} nenalezen.")
-            else:
-                timer_mgr.cancel_all()
-                display.show_system("Všechny timery zrušeny.")
-        else:
-            timers = timer_mgr.list_timers()
-            if timers:
-                display.show_system("Aktivní timery:")
-                for t in timers:
-                    remaining = int(t["remaining"])
-                    mins, secs = divmod(remaining, 60)
-                    display.show_system(
-                        f"  [{t['id']}] {t['label']} — zbývá {mins}m {secs}s"
-                    )
-            else:
-                display.show_system("Žádné aktivní timery.")
     elif cmd == "/model":
         if arg:
             config.ANTHROPIC_MODEL = arg
@@ -270,10 +313,21 @@ async def handle_command(
                 display.show_system(f"  {role}: {m['content'][:100]}...")
         else:
             display.show_system("V této relaci zatím žádné zprávy.")
+    elif cmd == "/oprav":
+        if not arg:
+            display.show_system("Použití: /oprav <instrukce>  (např. /oprav nepracuji v Google)")
+        else:
+            display.show_system("Opravuji profil...")
+            success = await memory.correct_profile(arg)
+            if success:
+                updated = memory.profile.get_summary()
+                display.show_system(f"Profil opraven. Aktuální: {updated}")
+            else:
+                display.show_system("Opravu se nepodařilo provést.")
     elif cmd == "/export":
         import json as _json
         export_data = {
-            "profile": db.get_all_profile(),
+            "profile": memory.profile.get_full_profile(),
             "conversations": [],
         }
         summaries = db.get_recent_summaries(limit=100)
@@ -490,12 +544,12 @@ async def _wait_for_action(
     event_queue: asyncio.Queue,
     input_task: asyncio.Task | None = None,
 ) -> tuple[str, object, asyncio.Task | None]:
-    """Race between user input and internal events (timers, idle).
+    """Race between user input and internal events (idle, iMessage).
 
     Returns (action_type, payload, ongoing_input_task).
     - ("input", user_text, None) — user typed something
-    - ("timer_expired", event_dict, input_task) — timer fired
     - ("idle_trigger", event_dict, input_task) — idle timeout
+    - ("imessage_new", event_dict, input_task) — new iMessage
     """
     if input_task is None:
         input_task = asyncio.create_task(display.get_user_input())
@@ -523,12 +577,35 @@ async def _wait_for_action(
 
 # ── Proactive response ────────────────────────────────────────────
 
-PROACTIVE_PROMPT = """\
+PROACTIVE_PROMPT_TIER1 = """\
 Jsi {assistant_name}, osobní AI asistentka. Právě je chvíli ticho v konverzaci s {user_name}.
 Řekni něco přirozeného — zeptej se na něco, nabídni pomoc, udělej postřeh, nebo navrhni aktivitu.
 Buď stručná (1-2 věty). Nebuď otravná, buď přirozená.
 Odpovídej ČESKY. NEPOUŽÍVEJ *akce v hvězdičkách*.\
 """
+
+SMART_PROACTIVE_PROMPT_TIER1 = """\
+Jsi {assistant_name}, osobní AI asistentka. Právě je chvíli ticho v konverzaci s {user_name}.
+Máš k dispozici kontext z předchozích rozhovorů a profil uživatele.
+
+Řekni něco přirozeného a KONTEXTOVĚ relevantního — například:
+- Zeptej se na výsledek něčeho, co uživatel zmínil dříve
+- Nabídni pomoc s něčím, co víš že uživatel řeší
+- Reaguj na denní dobu nebo situaci (ráno/večer/víkend)
+- Vrať se k zajímavému tématu z minulé konverzace
+- Udělej postřeh na základě toho, co víš o uživateli
+
+Buď stručná (1-2 věty). Nebuď otravná, buď přirozená a relevantní.
+Odpovídej ČESKY. NEPOUŽÍVEJ *akce v hvězdičkách*.\
+"""
+
+PROACTIVE_PROMPT_TIER2 = """\
+Jsi {assistant_name}, osobní AI asistentka. {user_name} je pryč už delší dobu.
+Napiš krátkou zprávu (1 věta), že tu stále jsi, ale pokud se neozve, za chvíli se vypneš.
+Buď přátelská a nenápadná. Odpovídej ČESKY. NEPOUŽÍVEJ *akce v hvězdičkách*.\
+"""
+
+SHUTDOWN_MESSAGE = "Tak já se vypínám. Kdybyste mě potřebovali, {user_name}, stačí mě zase spustit. Na shledanou."
 
 
 async def proactive_response(
@@ -538,16 +615,25 @@ async def proactive_response(
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
     current_messages: list[dict],
+    tier: int = 1,
 ) -> None:
     """Generate and display a proactive message from Eigy.
 
-    If text is provided, use it directly (e.g., timer notification).
+    If text is provided, use it directly.
     If text is None, ask the LLM to generate a contextual message.
+    tier controls which prompt is used (1 = casual check-in, 2 = pre-shutdown notice).
     """
     if text is None:
         # Generate contextual message via LLM
         try:
-            proactive_system = PROACTIVE_PROMPT.format(
+            if tier >= 2:
+                prompt_template = PROACTIVE_PROMPT_TIER2
+            elif config.SMART_PROACTIVE_ENABLED:
+                prompt_template = SMART_PROACTIVE_PROMPT_TIER1
+            else:
+                prompt_template = PROACTIVE_PROMPT_TIER1
+
+            proactive_system = prompt_template.format(
                 assistant_name=config.ASSISTANT_NAME,
                 user_name=memory.user_name,
             )
@@ -561,6 +647,30 @@ async def proactive_response(
                     "role": "system",
                     "content": f"Znáš o {memory.user_name}: {profile_summary}",
                 })
+
+            # Smart proactive: add episodic context for relevant follow-ups
+            if config.SMART_PROACTIVE_ENABLED and tier == 1 and memory.episodic:
+                recent_user = [m for m in current_messages if m["role"] == "user"]
+                if recent_user:
+                    query = recent_user[-1]["content"]
+                    episodes = memory.episodic.retrieve_relevant(query, top_k=3)
+                    if episodes:
+                        ep_text = "\n---\n".join(ep["document"] for ep in episodes)
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "Relevantní vzpomínky z minulých konverzací:\n"
+                                f"{ep_text}"
+                            ),
+                        })
+
+                # Add temporal context
+                if config.TEMPORAL_AWARENESS_ENABLED:
+                    messages.append({
+                        "role": "system",
+                        "content": MemoryManager._build_temporal_block(),
+                    })
+
             # Add last 5 messages for context
             recent = current_messages[-5:] if len(current_messages) > 5 else current_messages
             messages.extend(recent)
@@ -607,6 +717,7 @@ async def chat_loop(
     tts: TTSEngine,
     audio_player: AudioPlayer,
     avatar_queue: queue.Queue,
+    slog: SessionLogger | None = None,
 ) -> None:
     """Main chat loop — input, stream response, display, TTS, avatar events."""
     current_messages: list[dict] = []
@@ -616,9 +727,8 @@ async def chat_loop(
     imessage_cache: list[IMessage] = []
     imessage_contacts = ContactBook()
 
-    # Initialize timer manager and idle monitor
+    # Initialize idle monitor
     event_queue: asyncio.Queue = asyncio.Queue()
-    timer_mgr = TimerManager(event_queue)
     idle_monitor = IdleMonitor(event_queue)
 
     # Start idle monitor background task
@@ -674,7 +784,7 @@ async def chat_loop(
                 if user_input.startswith("/"):
                     await handle_command(
                         user_input, memory, db, tts, audio_player,
-                        avatar_queue, timer_mgr,
+                        avatar_queue, slog,
                     )
                     continue
 
@@ -688,16 +798,6 @@ async def chat_loop(
                     )
                     continue
 
-                # Check for timer request in natural language
-                timer_req = parse_timer_request(user_input)
-                if timer_req:
-                    seconds, label = timer_req
-                    timer_id = timer_mgr.add_timer(seconds, label)
-                    display.show_system(
-                        f"Timer nastaven: {label} (ID: {timer_id})"
-                    )
-                    # Still pass to LLM so Eigy can respond naturally
-
                 # Check for crypto price request (before web search)
                 crypto_context = None
                 crypto_id = detect_crypto_request(user_input)
@@ -707,6 +807,8 @@ async def chat_loop(
                     price_data = await fetch_crypto_price(crypto_id)
                     if price_data:
                         crypto_context = format_crypto_price(crypto_id, price_data)
+                    if slog:
+                        slog.log_crypto(crypto_id, price_data)
 
                 # Check for web search request
                 search_query = detect_search_request(user_input)
@@ -719,13 +821,56 @@ async def chat_loop(
                     results = await web_search(search_query)
                     if results:
                         search_context = format_search_results(results)
+                    if slog:
+                        slog.log_search(search_query, len(results) if results else 0)
 
                 # Add user message
                 current_messages.append({"role": "user", "content": user_input})
                 memory.save_message("user", user_input)
 
+                # Detect user mood (for emotional adaptation)
+                user_mood = None
+                if config.EMOTIONAL_ADAPTATION_ENABLED:
+                    if config.EMOTION_DETECTION == "llm":
+                        user_mood = await detect_user_mood_llm(user_input)
+                    else:
+                        user_mood = detect_user_mood(user_input)
+                    if user_mood and user_mood != "neutral":
+                        display.show_debug(f"Nálada uživatele: {user_mood}")
+
+                if slog:
+                    slog.log_user_message(user_input, mood=user_mood)
+                    if user_mood:
+                        slog.log_mood_detected(user_mood, config.EMOTION_DETECTION)
+
+                # Rolling window: summarize old messages if threshold exceeded
+                trimmed = await memory.maybe_summarize_window(current_messages)
+                if trimmed is not current_messages:
+                    current_messages.clear()
+                    current_messages.extend(trimmed)
+
+                # Chain-of-thought pre-reasoning (optional, adds latency)
+                internal_reasoning = None
+                if config.CHAIN_OF_THOUGHT_ENABLED:
+                    display.show_debug("Generuji pre-reasoning...")
+                    internal_reasoning = await memory.generate_pre_reasoning(
+                        current_messages
+                    )
+                    if slog:
+                        slog.log_pre_reasoning(internal_reasoning)
+
                 # Build context with memory
-                messages = memory.build_context(current_messages)
+                messages = memory.build_context(
+                    current_messages,
+                    user_mood=user_mood,
+                    internal_reasoning=internal_reasoning,
+                )
+                if slog:
+                    ctx_tokens = sum(len(m["content"]) // 3 for m in messages)
+                    slog.log_context_built(
+                        num_messages=len(messages),
+                        total_tokens=ctx_tokens,
+                    )
 
                 # Inject crypto price data
                 if crypto_context:
@@ -792,6 +937,8 @@ async def chat_loop(
                             sentences = sentence_buffer.add_token(token)
                             for sentence in sentences:
                                 await tts_queue.put(sentence)
+                                if slog:
+                                    slog.log_tts(sentence, config.TTS_VOICE)
 
                     stream_display.end()
                     avatar_queue.put({"type": "speaking_end"})
@@ -813,6 +960,8 @@ async def chat_loop(
                         await tts_queue.put(None)
                         await tts_worker
                     display.show_error(f"Odpověď selhala: {e}")
+                    if slog:
+                        slog.log_error(str(e), "response_streaming")
                     current_messages.pop()
                     continue
 
@@ -829,27 +978,43 @@ async def chat_loop(
 
                 memory.save_message("assistant", response_text, emotion=emotion)
 
+                if slog:
+                    slog.log_emotion_detected(emotion, config.EMOTION_DETECTION)
+                    slog.log_assistant_message(
+                        response_text, emotion=emotion,
+                        tokens=len(response_text) // 3,
+                    )
+
                 # Real-time fact extraction (background, non-blocking)
                 asyncio.create_task(
                     memory.extract_facts_realtime(user_input, response_text)
                 )
 
-            elif action_type == "timer_expired":
-                # Timer expired — Eigy proactively notifies
-                label = payload.get("label", "timer")
-                notification = f"Čas vypršel — {label} je u konce."
-                idle_monitor.reset()
-                await proactive_response(
-                    notification, memory, tts, audio_player,
-                    avatar_queue, current_messages,
+                # Store in episodic memory (background, non-blocking)
+                asyncio.create_task(
+                    memory.store_episode(user_input, response_text)
                 )
 
             elif action_type == "idle_trigger":
-                # Idle timeout — Eigy says something contextual
+                # Tiered idle — tier 1 = casual check-in, tier 2 = pre-shutdown notice
+                tier = payload.get("tier", 1)
+                if slog:
+                    slog.log_proactive(tier, "(generating...)")
                 await proactive_response(
                     None, memory, tts, audio_player,
-                    avatar_queue, current_messages,
+                    avatar_queue, current_messages, tier=tier,
                 )
+
+            elif action_type == "idle_shutdown":
+                # Auto-shutdown after prolonged inactivity
+                farewell = SHUTDOWN_MESSAGE.format(user_name=memory.user_name)
+                display.show_assistant(farewell)
+                current_messages.append({"role": "assistant", "content": farewell})
+                memory.save_message("assistant", farewell)
+                await _speak(farewell, tts, audio_player, avatar_queue)
+                if slog:
+                    slog.log_proactive(3, farewell)
+                break
 
             elif action_type == "imessage_new":
                 # New iMessage arrived — display and read aloud
@@ -859,15 +1024,23 @@ async def chat_loop(
                     notification = f"Nová zpráva od {name}: {msg.text}"
                     display.show_system(f"  iMessage od {name}: {msg.text}")
                     idle_monitor.reset()
+                    if slog:
+                        slog.log("imessage_received", sender=name, text=msg.text)
                     await proactive_response(
                         notification, memory, tts, audio_player,
                         avatar_queue, current_messages,
                     )
 
     finally:
-        # Cleanup
+        # Cancel pending input task — don't await it because
+        # prompt_toolkit's blocking prompt() can't be interrupted.
+        # The daemon thread will clean up on process exit.
+        if ongoing_input_task is not None and not ongoing_input_task.done():
+            ongoing_input_task.cancel()
+        # Signal avatar window to close immediately
+        avatar_queue.put({"type": "quit"})
+        # Cleanup background tasks
         idle_monitor.stop()
-        timer_mgr.cancel_all()
         idle_task.cancel()
         imessage_watcher_task.cancel()
         if imessage_db_holder[0] is not None:
