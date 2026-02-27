@@ -149,9 +149,20 @@ class SessionLogger:
         """Log assistant emotion detection result."""
         self.log("emotion_detected", emotion=emotion, method=method)
 
-    def log_search(self, query: str, num_results: int) -> None:
-        """Log a web search trigger."""
-        self.log("search_triggered", query=query, num_results=num_results)
+    def log_search(
+        self,
+        query: str,
+        num_results: int,
+        original_query: str | None = None,
+        summarized: bool = False,
+    ) -> None:
+        """Log a web search trigger with optional refinement info."""
+        data: dict = {"query": query, "num_results": num_results}
+        if original_query:
+            data["original_query"] = original_query
+        if summarized:
+            data["summarized"] = True
+        self.log("search_triggered", **data)
 
     def log_crypto(self, crypto_id: str, price_data: dict | None = None) -> None:
         """Log a crypto price lookup."""

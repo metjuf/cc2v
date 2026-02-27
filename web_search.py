@@ -574,3 +574,120 @@ def format_results(results: list[dict]) -> str:
         sections.append("\n".join(parts))
 
     return "\n\n".join(sections)
+
+
+# ── Vague query detection & LLM refinement ───────────────────────
+
+_VAGUE_PRONOUNS_RE = re.compile(
+    r"\b(?:to|ty|ten|ta|ti|tu|tam|toho|tomu|tím|tom|této|tohle|tamto|tamten|"
+    r"je[jh]o|jej[ií]?|ji|ho|mu|ní|něj|něm|nich|jim|jich|jejich|"
+    r"se|si|mě|mně|mi|nás|nám|vás|vám)\b",
+    re.IGNORECASE,
+)
+
+_REFINE_QUERY_PROMPT = """\
+Uživatel chce vyhledat informace na webu. Z jeho zprávy byl extrahován dotaz, \
+ale je příliš vágní (obsahuje zájmena nebo nejasné odkazy).
+
+Kontext konverzace (poslední zprávy):
+{context}
+
+Extrahovaný dotaz: "{query}"
+
+Přeformuluj dotaz tak, aby byl konkrétní a vhodný pro webový vyhledávač. \
+Nahraď zájmena a odkazy konkrétními názvy z kontextu.
+Odpověz POUZE přeformulovaným dotazem, nic jiného."""
+
+
+def is_vague_query(query: str) -> bool:
+    """Check if a search query is too vague (short + contains pronouns)."""
+    words = query.split()
+    if len(words) > 5:
+        return False
+    return bool(_VAGUE_PRONOUNS_RE.search(query))
+
+
+async def refine_search_query(
+    query: str, recent_messages: list[dict]
+) -> str:
+    """Refine a vague search query using LLM and conversation context.
+
+    Returns the original query if it's specific enough,
+    or a reformulated version if it's vague.
+    """
+    if not is_vague_query(query):
+        return query
+
+    from chat_engine import get_auxiliary_response
+
+    # Build context from last few messages
+    context_lines = []
+    for msg in recent_messages[-6:]:
+        role = "Uživatel" if msg["role"] == "user" else "Asistentka"
+        content = msg["content"][:200]
+        context_lines.append(f"{role}: {content}")
+    context = "\n".join(context_lines)
+
+    try:
+        prompt = _REFINE_QUERY_PROMPT.format(context=context, query=query)
+        result = await get_auxiliary_response([
+            {"role": "user", "content": prompt},
+        ])
+        refined = result.strip().strip('"').strip("'")
+        if refined and len(refined) >= 3:
+            logger.info("Query refined: '%s' → '%s'", query, refined)
+            return refined
+    except Exception as e:
+        logger.warning("Query refinement failed: %s", e)
+
+    return query
+
+
+# ── Search results summarization ─────────────────────────────────
+
+_SUMMARIZE_RESULTS_PROMPT = """\
+Jsi pomocník pro webové vyhledávání. Zpracuj výsledky vyhledávání a vytvoř \
+stručný, informativní souhrn pro AI asistentku, která bude odpovídat uživateli.
+
+Dotaz uživatele: "{query}"
+
+Výsledky vyhledávání:
+{results}
+
+INSTRUKCE:
+- Vytvoř stručný souhrn klíčových informací nalezených ve výsledcích
+- Uveď konkrétní fakta, čísla, data
+- Na konci uveď zdroje jen jako seznam domén (např. "Zdroje: example.com, test.cz")
+- NEPOUŽÍVEJ formát [1], [2] ani číslované seznamy výsledků
+- Piš česky, stručně a informativně
+- Pokud výsledky nejsou relevantní, napiš "Relevantní informace nenalezeny.\""""
+
+
+async def summarize_search_results(
+    query: str, formatted_results: str
+) -> str:
+    """Use aux model to summarize raw search results into natural text.
+
+    Returns a clean, natural-language summary instead of raw [1], [2] format.
+    Falls back to original formatted results if summarization fails.
+    """
+    from chat_engine import get_auxiliary_response
+
+    try:
+        prompt = _SUMMARIZE_RESULTS_PROMPT.format(
+            query=query, results=formatted_results,
+        )
+        summary = await get_auxiliary_response([
+            {"role": "user", "content": prompt},
+        ])
+        summary = summary.strip()
+        if summary and len(summary) >= 20:
+            logger.info(
+                "Search results summarized: %d → %d chars",
+                len(formatted_results), len(summary),
+            )
+            return summary
+    except Exception as e:
+        logger.warning("Search summarization failed: %s", e)
+
+    return formatted_results

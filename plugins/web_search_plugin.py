@@ -15,6 +15,9 @@ from web_search import (
     _find_crypto_mention,
     fetch_crypto_price,
     format_crypto_price,
+    is_vague_query,
+    refine_search_query,
+    summarize_search_results,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,18 +59,37 @@ class WebSearchPlugin(Plugin):
 
         # 2. Web search (skip if crypto data already found)
         search_context = None
+        original_query = None
         search_query = detect_search_request(user_input)
         if search_query and not crypto_context:
+            # Refine vague queries using LLM + conversation context
+            original_query = search_query
+            if is_vague_query(search_query):
+                search_query = await refine_search_query(
+                    search_query, ctx.current_messages,
+                )
+                if search_query != original_query:
+                    logger.info(
+                        "Query refined: '%s' → '%s'",
+                        original_query, search_query,
+                    )
+
             display.show_system(f"Hledám: {search_query}...")
             if not crypto_id:
                 ctx.avatar_queue.put({"type": "thinking_start"})
                 result.show_thinking = True
             results = await web_search(search_query)
             if results:
-                search_context = format_search_results(results)
+                raw_results = format_search_results(results)
+                # Summarize raw results via aux model
+                search_context = await summarize_search_results(
+                    search_query, raw_results,
+                )
             if ctx.slog:
                 ctx.slog.log_search(
-                    search_query, len(results) if results else 0
+                    search_query, len(results) if results else 0,
+                    original_query=original_query if original_query != search_query else None,
+                    summarized=search_context is not None and results is not None,
                 )
 
         # 3. Build context messages
@@ -86,15 +108,12 @@ class WebSearchPlugin(Plugin):
             result.context_messages.append({
                 "role": "system",
                 "content": (
-                    f'VÝSLEDKY VYHLEDÁVÁNÍ pro "{search_query}":\n\n'
+                    f"Informace z webu k dotazu \"{search_query}\":\n\n"
                     f"{search_context}\n\n"
-                    "INSTRUKCE: Využij výše uvedené výsledky a obsah "
-                    "stránek k sestavení přesné a informativní odpovědi. "
-                    "Uváděj konkrétní fakta z obsahu. Na konci uveď "
-                    "zdroje STRUČNĚ jen názvem domény (např. 'Zdroje: "
-                    "mobilmania.cz, itmix.cz') — NIKDY nevypisuj celé "
-                    "URL adresy. Pokud výsledky nejsou relevantní, "
-                    "řekni to a odpověz z vlastních znalostí."
+                    "INSTRUKCE: Odpověz PŘIROZENĚ vlastními slovy na "
+                    "základě těchto informací. NEKOPÍRUJ formát výsledků. "
+                    "Pokud informace nejsou relevantní, odpověz z "
+                    "vlastních znalostí."
                 ),
             })
 
