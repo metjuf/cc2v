@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from book_reader import find_book, _split_into_chunks, parse_epub
-from main import detect_book_command
+from plugins.book_reader_plugin import detect_book_command
 
 
 # ── find_book tests ──────────────────────────────────────────────

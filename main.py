@@ -22,16 +22,12 @@ from avatar.emotion_detector import (
 )
 from memory.database import Database
 from memory.memory_manager import MemoryManager
+from plugins import PluginManager
+from plugins.base import PluginContext
 from proactive import IdleMonitor
 from session_logger import SessionLogger
-from web_search import (
-    detect_search_request, search as web_search, format_results as format_search_results,
-    detect_crypto_request, fetch_crypto_price, format_crypto_price,
-)
 from tts_engine import TTSEngine, SentenceBuffer, cleanup_temp_files
 from audio_player import AudioPlayer
-from book_reader import find_book, parse_epub, book_reading_task, BookInfo
-from imessage_bot import MessagesDB, IMessage, send_imessage, ContactBook
 
 # Episodic memory (optional dependency)
 try:
@@ -346,386 +342,8 @@ async def handle_command(
     return True
 
 
-# ── iMessage integration ──────────────────────────────────────────
-
-_IMESSAGE_SHOW_RE = re.compile(
-    r"^zobraz\s+imessage(?:\s+(\d+))?$", re.IGNORECASE
-)
-_IMESSAGE_REPLY_RE = re.compile(
-    r"^odep(?:is|iš)\s+na\s+imessage\s+(\d+)$", re.IGNORECASE
-)
-_IMESSAGE_SAVE_RE = re.compile(
-    r"^ulo[žz]\s+kontakt\s+(\d+)\s+(.+)$", re.IGNORECASE
-)
-_IMESSAGE_CONTACTS_RE = re.compile(
-    r"^kontakty?$", re.IGNORECASE
-)
-
-
-def detect_imessage_command(text: str) -> tuple[str, str] | None:
-    """Detect iMessage command in user input. Returns (cmd, arg) or None."""
-    text = text.strip()
-
-    m = _IMESSAGE_SHOW_RE.match(text)
-    if m:
-        return ("zobraz", m.group(1) or "5")
-
-    m = _IMESSAGE_REPLY_RE.match(text)
-    if m:
-        return ("reply", m.group(1))
-
-    m = _IMESSAGE_SAVE_RE.match(text)
-    if m:
-        return ("save_contact", f"{m.group(1)} {m.group(2)}")
-
-    if _IMESSAGE_CONTACTS_RE.match(text):
-        return ("list_contacts", "")
-
-    return None
-
-
-# ── Book reader commands ─────────────────────────────────────────
-
-_BOOK_READ_RE = re.compile(
-    r"^(?:čti|přečti|pokračuj\s+(?:v\s+)?(?:čtení|četbě))\s+(?:knihu?\s+)?(.+)$",
-    re.IGNORECASE,
-)
-_BOOK_STOP_RE = re.compile(
-    r"^(?:zastav|stop|přestaň|pozastav)\s+(?:čtení|četbu)$",
-    re.IGNORECASE,
-)
-_BOOK_DELETE_RE = re.compile(
-    r"^(?:vymaž|smaž|odstraň)\s+záložku\s+(.+)$",
-    re.IGNORECASE,
-)
-
-
-def detect_book_command(text: str) -> tuple[str, str] | None:
-    """Detect book reader command. Returns (cmd, arg) or None."""
-    text = text.strip()
-
-    m = _BOOK_READ_RE.match(text)
-    if m:
-        return ("read", m.group(1).strip())
-
-    if _BOOK_STOP_RE.match(text):
-        return ("stop", "")
-
-    m = _BOOK_DELETE_RE.match(text)
-    if m:
-        return ("delete", m.group(1).strip())
-
-    return None
-
-
-async def _stop_book_reading(
-    reading_state: dict,
-    audio_player: AudioPlayer,
-) -> int | None:
-    """Cancel an active book reading task. Returns last page or None."""
-    if not reading_state.get("task"):
-        return None
-
-    cancel_event = reading_state.get("cancel_event")
-    task = reading_state["task"]
-
-    if cancel_event:
-        cancel_event.set()
-    audio_player.stop()
-
-    # Wait briefly for the task to finish
-    try:
-        await asyncio.wait_for(task, timeout=3.0)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        task.cancel()
-
-    last_page = reading_state.get("current_page", 0)
-    reading_state.clear()
-    return last_page
-
-
-async def handle_book_command(
-    cmd: str,
-    arg: str,
-    db: Database,
-    memory: MemoryManager,
-    tts: TTSEngine,
-    audio_player: AudioPlayer,
-    avatar_queue: queue.Queue,
-    event_queue: asyncio.Queue,
-    current_messages: list[dict],
-    reading_state: dict,
-    slog: SessionLogger | None = None,
-) -> None:
-    """Handle book reader commands (read/stop/delete)."""
-
-    if cmd == "read":
-        book_name = arg
-
-        # Find the EPUB file
-        path = find_book(book_name)
-        if not path:
-            display.show_system(
-                f"Kniha '{book_name}' nenalezena v {config.BOOKS_DIR}/"
-            )
-            return
-
-        # Stop any existing reading
-        await _stop_book_reading(reading_state, audio_player)
-
-        # Parse the book
-        try:
-            book = parse_epub(path)
-        except Exception as e:
-            display.show_error(f"Nepodařilo se načíst knihu: {e}")
-            logger.error("EPUB parse failed: %s", e)
-            return
-
-        # Load or create bookmark
-        bookmark = db.get_bookmark(book_name.lower())
-        start_page = bookmark["current_page"] if bookmark else 0
-
-        # If already finished, start from beginning
-        if start_page >= book.total_pages:
-            start_page = 0
-
-        # Announce
-        if start_page > 0:
-            msg = (
-                f"Pokračuji ve čtení '{book.title}' "
-                f"od stránky {start_page + 1} z {book.total_pages}."
-            )
-        else:
-            msg = (
-                f"Začínám číst '{book.title}' — "
-                f"{book.total_pages} stránek."
-            )
-
-        display.show_assistant(msg)
-        current_messages.append({"role": "assistant", "content": msg})
-        memory.save_message("assistant", msg)
-        await _speak(msg, tts, audio_player, avatar_queue)
-
-        # Set up reading state
-        cancel_event = asyncio.Event()
-
-        def update_bookmark(page: int) -> None:
-            reading_state["current_page"] = page
-            db.save_bookmark(book_name.lower(), page, book.total_pages)
-
-        # Save initial bookmark
-        db.save_bookmark(book_name.lower(), start_page, book.total_pages)
-
-        # Launch background reading task
-        task = asyncio.create_task(
-            book_reading_task(
-                book=book,
-                start_page=start_page,
-                tts=tts,
-                audio_player=audio_player,
-                event_queue=event_queue,
-                cancel_event=cancel_event,
-                update_bookmark=update_bookmark,
-            )
-        )
-
-        reading_state["task"] = task
-        reading_state["cancel_event"] = cancel_event
-        reading_state["book"] = book
-        reading_state["current_page"] = start_page
-        reading_state["book_name"] = book_name.lower()
-
-        if slog:
-            slog.log("book_start", title=book.title, page=start_page, total=book.total_pages)
-
-    elif cmd == "stop":
-        if not reading_state.get("task"):
-            display.show_system("Momentálně nic nečtu.")
-            return
-
-        book = reading_state.get("book")
-        last_page = await _stop_book_reading(reading_state, audio_player)
-
-        title = book.title if book else "knihu"
-        total = book.total_pages if book else "?"
-        msg = f"Zastavila jsem čtení '{title}' na stránce {last_page} z {total}."
-
-        display.show_assistant(msg)
-        current_messages.append({"role": "assistant", "content": msg})
-        memory.save_message("assistant", msg)
-
-        if slog:
-            slog.log("book_stop", title=title, page=last_page)
-
-    elif cmd == "delete":
-        book_name = arg
-        existed = db.delete_bookmark(book_name.lower())
-
-        if existed:
-            msg = f"Záložka pro '{book_name}' smazána."
-        else:
-            msg = f"Žádná záložka pro '{book_name}' neexistuje."
-
-        display.show_assistant(msg)
-        current_messages.append({"role": "assistant", "content": msg})
-        memory.save_message("assistant", msg)
-
-        if slog:
-            slog.log("book_delete_bookmark", book_name=book_name, existed=existed)
-
-
-async def handle_imessage_command(
-    cmd: str,
-    arg: str,
-    imessage_db: MessagesDB | None,
-    imessage_cache: list[IMessage],
-    contacts: ContactBook,
-) -> tuple[MessagesDB | None, list[IMessage], bool]:
-    """Handle iMessage command. Returns (db, cache, handled)."""
-    from pathlib import Path
-
-    # Contact listing doesn't need DB
-    if cmd == "list_contacts":
-        all_c = contacts.all_contacts()
-        if not all_c:
-            display.show_system("Žádné uložené kontakty.")
-        else:
-            display.show_system("Uložené kontakty:")
-            for phone, name in all_c.items():
-                display.show_system(f"  {name} ({phone})")
-        return imessage_db, imessage_cache, True
-
-    # Save contact uses cache but not DB
-    if cmd == "save_contact":
-        parts = arg.split(maxsplit=1)
-        if len(parts) < 2:
-            display.show_system("Použití: ulož kontakt X Jméno")
-            return imessage_db, imessage_cache, True
-        try:
-            idx = int(parts[0])
-        except ValueError:
-            display.show_system(f"Neplatné číslo: {parts[0]}")
-            return imessage_db, imessage_cache, True
-        if not imessage_cache or idx < 1 or idx > len(imessage_cache):
-            display.show_system('Nejdřív "zobraz imessage", pak ulož kontakt.')
-            return imessage_db, imessage_cache, True
-        target = imessage_cache[idx - 1]
-        name = parts[1].strip()
-        contacts.set_contact(target.sender, name)
-        display.show_system(f"Uloženo: {target.sender} → {name}")
-        return imessage_db, imessage_cache, True
-
-    # Lazy-init DB on first use
-    if imessage_db is None:
-        db_path = Path.home() / "Library" / "Messages" / "chat.db"
-        if not db_path.exists():
-            display.show_system("Chyba: Databáze iMessage nenalezena.")
-            return None, imessage_cache, True
-        try:
-            imessage_db = MessagesDB(db_path)
-        except Exception as e:
-            display.show_system(
-                f"Chyba: Nelze otevřít iMessage DB: {e}\n"
-                "  Zkontroluj Full Disk Access pro Terminal."
-            )
-            return None, imessage_cache, True
-
-    if cmd == "zobraz":
-        count = max(1, min(int(arg), 50))
-        messages = imessage_db.get_recent_incoming(count)
-        if not messages:
-            display.show_system("Žádné příchozí zprávy.")
-        else:
-            imessage_cache.clear()
-            imessage_cache.extend(messages)
-            display.show_system(f"Posledních {len(messages)} iMessage zpráv:")
-            for i, msg in enumerate(messages, 1):
-                ts = msg.timestamp.strftime("%d.%m. %H:%M")
-                name = contacts.get_name(msg.sender)
-                display.show_system(f"  [{i}] {name} ({ts})")
-                display.show_system(f"      {msg.text}")
-        return imessage_db, imessage_cache, True
-
-    if cmd == "reply":
-        num = int(arg)
-        if not imessage_cache:
-            display.show_system('Nejdřív napiš "zobraz imessage" pro načtení zpráv.')
-            return imessage_db, imessage_cache, True
-        if num < 1 or num > len(imessage_cache):
-            display.show_system(f"Neplatné číslo. Zadej 1–{len(imessage_cache)}.")
-            return imessage_db, imessage_cache, True
-
-        msg = imessage_cache[num - 1]
-        ts = msg.timestamp.strftime("%d.%m. %H:%M")
-        name = contacts.get_name(msg.sender)
-        display.show_system(f"Odpovědět na zprávu od {name} ({ts}):")
-        display.show_system(f"  \"{msg.text}\"")
-        display.show_system("Napiš odpověď (nebo prázdný řádek pro zrušení):")
-
-        reply_text = await display.get_user_input()
-        if not reply_text:
-            display.show_system("Zrušeno.")
-            return imessage_db, imessage_cache, True
-
-        display.show_system(f'Odeslat "{reply_text}" → {name}? (a/n)')
-        confirm = await display.get_user_input()
-        if confirm and confirm.lower() in ("a", "ano", "y", "yes"):
-            display.show_system("Odesílám...")
-            if send_imessage(msg.sender, reply_text):
-                display.show_system("Zpráva odeslána!")
-            else:
-                display.show_system("Chyba: Odeslání selhalo. Zkontroluj Messages.app.")
-        else:
-            display.show_system("Zrušeno.")
-
-        return imessage_db, imessage_cache, True
-
-    return imessage_db, imessage_cache, False
-
-
-# ── iMessage async watcher ───────────────────────────────────────
-
-_IMESSAGE_WATCH_INTERVAL = 5  # seconds
-
-
-async def _imessage_watcher(
-    event_queue: asyncio.Queue,
-    imessage_db_holder: list,
-) -> None:
-    """Async background task: polls iMessage DB for new messages.
-
-    Pushes {"type": "imessage_new", "messages": [...]} events.
-    imessage_db_holder is a 1-element list so we can lazy-init and share.
-    """
-    from pathlib import Path
-
-    db_path = Path.home() / "Library" / "Messages" / "chat.db"
-    if not db_path.exists():
-        return
-
-    # Try to open DB
-    try:
-        watcher_db = MessagesDB(db_path)
-    except Exception:
-        return
-
-    last_rowid = watcher_db.get_latest_rowid()
-    # Share DB instance so zobraz/reply can reuse it
-    if not imessage_db_holder[0]:
-        imessage_db_holder[0] = watcher_db
-
-    while True:
-        await asyncio.sleep(_IMESSAGE_WATCH_INTERVAL)
-        try:
-            new_msgs = watcher_db.get_messages_since(last_rowid)
-            for msg in new_msgs:
-                last_rowid = max(last_rowid, msg.rowid)
-                await event_queue.put({
-                    "type": "imessage_new",
-                    "message": msg,
-                })
-        except Exception as e:
-            logger.warning("iMessage watcher error: %s", e)
+# Backwards compatibility for tests
+from plugins.book_reader_plugin import detect_book_command  # noqa: E402,F401
 
 
 # ── Input/event race ──────────────────────────────────────────────
@@ -911,24 +529,37 @@ async def chat_loop(
     slog: SessionLogger | None = None,
 ) -> None:
     """Main chat loop — input, stream response, display, TTS, avatar events."""
+    from functools import partial
+
     current_messages: list[dict] = []
 
-    # iMessage integration state (lazy-initialized on first use)
-    imessage_db_holder: list = [None]  # mutable holder for lazy-init sharing
-    imessage_cache: list[IMessage] = []
-    imessage_contacts = ContactBook()
-
-    # Initialize idle monitor
+    # Initialize event queue and idle monitor
     event_queue: asyncio.Queue = asyncio.Queue()
     idle_monitor = IdleMonitor(event_queue)
-
-    # Start idle monitor background task
     idle_task = asyncio.create_task(idle_monitor.run())
 
-    # Start iMessage watcher (pushes imessage_new events to queue)
-    imessage_watcher_task = asyncio.create_task(
-        _imessage_watcher(event_queue, imessage_db_holder)
+    # Create plugin context
+    ctx = PluginContext(
+        db=db,
+        memory=memory,
+        tts=tts,
+        audio_player=audio_player,
+        avatar_queue=avatar_queue,
+        event_queue=event_queue,
+        current_messages=current_messages,
+        slog=slog,
+        speak=partial(_speak, tts=tts, audio_player=audio_player, avatar_queue=avatar_queue),
+        proactive=partial(
+            proactive_response,
+            memory=memory, tts=tts, audio_player=audio_player,
+            avatar_queue=avatar_queue, current_messages=current_messages,
+        ),
     )
+
+    # Initialize and discover plugins
+    pm = PluginManager()
+    pm.discover()
+    await pm.start_backgrounds(ctx)
 
     # Greeting for returning users
     if memory.user_name not in ("friend", "šéfe"):
@@ -941,7 +572,6 @@ async def chat_loop(
     display.show_system("Napiš /help pro příkazy, 'exit' pro ukončení.")
 
     ongoing_input_task: asyncio.Task | None = None
-    reading_state: dict = {}  # Active book reading task state
 
     try:
         while True:
@@ -954,14 +584,14 @@ async def chat_loop(
                 user_input = payload
                 idle_monitor.reset()
 
-                # Decide whether to stop book reading on this input.
-                # Slash commands and book commands don't interrupt reading.
-                _is_slash = isinstance(user_input, str) and user_input.startswith("/")
-                _is_book_cmd = isinstance(user_input, str) and detect_book_command(user_input) is not None
-                if reading_state.get("task") and not _is_slash and not _is_book_cmd:
-                    await _stop_book_reading(reading_state, audio_player)
-                elif not reading_state.get("task"):
-                    audio_player.stop()  # interrupt any playing speech
+                # Check if any plugin wants its activity interrupted
+                if isinstance(user_input, str) and pm.check_interrupt(ctx, user_input):
+                    # Plugin handles its own interruption via shutdown hook
+                    for p in pm.plugins:
+                        if p.should_interrupt_on_input(ctx, user_input):
+                            await p.shutdown(ctx)
+                elif not pm.any_active_task(ctx):
+                    audio_player.stop()
 
                 if user_input is None:
                     break  # EOF / Ctrl+D
@@ -980,7 +610,7 @@ async def chat_loop(
                 if not user_input:
                     continue
 
-                # Commands
+                # Slash commands (core — stay in main.py)
                 if user_input.startswith("/"):
                     await handle_command(
                         user_input, memory, db, tts, audio_player,
@@ -988,52 +618,13 @@ async def chat_loop(
                     )
                     continue
 
-                # iMessage commands (zobraz imessage, odepiš na imessage, kontakty)
-                imsg_cmd = detect_imessage_command(user_input)
-                if imsg_cmd:
-                    imessage_db_holder[0], imessage_cache, _ = await handle_imessage_command(
-                        imsg_cmd[0], imsg_cmd[1],
-                        imessage_db_holder[0], imessage_cache,
-                        imessage_contacts,
-                    )
+                # Plugin command detection (replaces iMessage + book reader blocks)
+                cmd_result = await pm.detect_command(ctx, user_input)
+                if cmd_result.handled:
                     continue
 
-                # Book reader commands (čti knihu X, zastav čtení, vymaž záložku X)
-                book_cmd = detect_book_command(user_input)
-                if book_cmd:
-                    await handle_book_command(
-                        book_cmd[0], book_cmd[1],
-                        db, memory, tts, audio_player,
-                        avatar_queue, event_queue, current_messages,
-                        reading_state, slog,
-                    )
-                    continue
-
-                # Check for crypto price request (before web search)
-                crypto_context = None
-                crypto_id = detect_crypto_request(user_input)
-                if crypto_id:
-                    display.show_system(f"Načítám cenu: {crypto_id}...")
-                    avatar_queue.put({"type": "thinking_start"})
-                    price_data = await fetch_crypto_price(crypto_id)
-                    if price_data:
-                        crypto_context = format_crypto_price(crypto_id, price_data)
-                    if slog:
-                        slog.log_crypto(crypto_id, price_data)
-
-                # Check for web search request
-                search_query = detect_search_request(user_input)
-                search_context = None
-                if search_query and not crypto_context:
-                    # Skip web search if we already have live crypto data
-                    display.show_system(f"Hledám: {search_query}...")
-                    if not crypto_id:
-                        avatar_queue.put({"type": "thinking_start"})
-                    results = await web_search(search_query)
-                    if results:
-                        search_context = format_search_results(results)
-                    if slog:
-                        slog.log_search(search_query, len(results) if results else 0)
+                # Plugin pre-response (replaces crypto + web search blocks)
+                pre = await pm.pre_response(ctx, user_input)
 
                 # Add user message
                 current_messages.append({"role": "user", "content": user_input})
@@ -1084,34 +675,12 @@ async def chat_loop(
                         style_hint=memory.last_style_hint,
                     )
 
-                # Inject crypto price data
-                if crypto_context:
-                    messages.insert(-1, {
-                        "role": "system",
-                        "content": (
-                            f"{crypto_context}\n\n"
-                            "INSTRUKCE: Toto jsou ŽIVÁ tržní data z CoinGecko API. "
-                            "Použij PŘESNĚ tyto hodnoty ve své odpovědi. NEVYMÝŠLEJ jiné ceny."
-                        ),
-                    })
+                # Inject plugin context messages (crypto, search, etc.)
+                for cm in pre.context_messages:
+                    messages.insert(-1, cm)
 
-                # Inject search results into context (before the last user message)
-                if search_context:
-                    messages.insert(-1, {
-                        "role": "system",
-                        "content": (
-                            f"VÝSLEDKY VYHLEDÁVÁNÍ pro \"{search_query}\":\n\n"
-                            f"{search_context}\n\n"
-                            "INSTRUKCE: Využij výše uvedené výsledky a obsah stránek k sestavení "
-                            "přesné a informativní odpovědi. Uváděj konkrétní fakta z obsahu. "
-                            "Na konci uveď zdroje STRUČNĚ jen názvem domény (např. 'Zdroje: mobilmania.cz, itmix.cz') — "
-                            "NIKDY nevypisuj celé URL adresy. Pokud výsledky nejsou relevantní, "
-                            "řekni to a odpověz z vlastních znalostí."
-                        ),
-                    })
-
-                # Notify avatar: thinking
-                if not search_query:
+                # Notify avatar: thinking (if plugins didn't already)
+                if not pre.show_thinking:
                     avatar_queue.put({"type": "thinking_start"})
 
                 # Stream response with sentence-level TTS
@@ -1208,10 +777,9 @@ async def chat_loop(
                 )
 
             elif action_type == "idle_trigger":
-                # Suppress proactive messages while reading a book
-                if reading_state.get("task"):
+                # Suppress proactive messages while a plugin has active work
+                if pm.any_active_task(ctx):
                     continue
-                # Tiered idle — tier 1 = casual check-in, tier 2 = pre-shutdown notice
                 tier = payload.get("tier", 1)
                 if slog:
                     slog.log_proactive(tier, "(generating...)")
@@ -1221,10 +789,8 @@ async def chat_loop(
                 )
 
             elif action_type == "idle_shutdown":
-                # Don't auto-shutdown while reading a book
-                if reading_state.get("task"):
+                if pm.any_active_task(ctx):
                     continue
-                # Auto-shutdown after prolonged inactivity
                 farewell = SHUTDOWN_MESSAGE.format(user_name=memory.user_name)
                 display.show_assistant(farewell)
                 current_messages.append({"role": "assistant", "content": farewell})
@@ -1234,70 +800,23 @@ async def chat_loop(
                     slog.log_proactive(3, farewell)
                 break
 
-            elif action_type == "imessage_new":
-                # New iMessage arrived — display and read aloud
-                msg = payload.get("message")
-                if msg:
-                    name = imessage_contacts.get_name(msg.sender)
-                    notification = f"Nová zpráva od {name}: {msg.text}"
-                    display.show_system(f"  iMessage od {name}: {msg.text}")
+            else:
+                # Delegate all other events to plugins
+                consumed = await pm.handle_event(ctx, payload if isinstance(payload, dict) else {"type": action_type})
+                if consumed:
                     idle_monitor.reset()
-                    if slog:
-                        slog.log("imessage_received", sender=name, text=msg.text)
-                    await proactive_response(
-                        notification, memory, tts, audio_player,
-                        avatar_queue, current_messages,
-                    )
-
-            elif action_type == "book_progress":
-                # Book reading progress update
-                title = payload.get("title", "?")
-                page = payload.get("page", 0)
-                total = payload.get("total", 0)
-                msg = f"Čtu ti '{title}', stránka {page} z {total}."
-                display.show_system(msg)
-                current_messages.append({"role": "assistant", "content": msg})
-                memory.save_message("assistant", msg)
-                if slog:
-                    slog.log("book_progress", title=title, page=page, total=total)
-
-            elif action_type == "book_finished":
-                # Book reading completed
-                title = payload.get("title", "?")
-                total = payload.get("total", 0)
-                msg = f"Dočetla jsem '{title}' — {total} stránek."
-                display.show_assistant(msg)
-                current_messages.append({"role": "assistant", "content": msg})
-                memory.save_message("assistant", msg)
-                reading_state.clear()
-                if slog:
-                    slog.log("book_finished", title=title, total=total)
 
     finally:
-        # Cancel pending input task — don't await it because
-        # prompt_toolkit's blocking prompt() can't be interrupted.
-        # The daemon thread will clean up on process exit.
         if ongoing_input_task is not None and not ongoing_input_task.done():
             ongoing_input_task.cancel()
-        # Signal avatar window to close immediately
         avatar_queue.put({"type": "quit"})
-        # Cleanup background tasks
+        # Shutdown plugins (cancels background tasks, closes resources)
+        await pm.shutdown_all(ctx)
+        # Cleanup idle monitor
         idle_monitor.stop()
         idle_task.cancel()
-        imessage_watcher_task.cancel()
-        # Stop book reading if active
-        if reading_state.get("cancel_event"):
-            reading_state["cancel_event"].set()
-        if reading_state.get("task") and not reading_state["task"].done():
-            reading_state["task"].cancel()
-        if imessage_db_holder[0] is not None:
-            imessage_db_holder[0].close()
         try:
             await idle_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await imessage_watcher_task
         except asyncio.CancelledError:
             pass
 

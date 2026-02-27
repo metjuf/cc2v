@@ -230,7 +230,7 @@ _CRYPTO_MENTION_RE = re.compile(
 
 
 def detect_crypto_request(text: str) -> str | None:
-    """Detect a crypto price request. Returns CoinGecko coin ID or None."""
+    """Detect a crypto price request (regex only). Returns CoinGecko coin ID or None."""
     text_lower = text.lower()
 
     # Check explicit price patterns first: "cena bitcoinu", "kurz etheru"
@@ -248,6 +248,62 @@ def detect_crypto_request(text: str) -> str | None:
         cm = _CRYPTO_MENTION_RE.search(text_lower)
         if cm:
             return _CRYPTO_ALIASES[cm.group(1).lower()]
+
+    return None
+
+
+def _find_crypto_mention(text: str) -> str | None:
+    """Check if text mentions any known cryptocurrency name.
+
+    Returns the CoinGecko coin ID if found, None otherwise.
+    Does NOT check intent — just whether a crypto is mentioned.
+    """
+    cm = _CRYPTO_MENTION_RE.search(text.lower())
+    if cm:
+        return _CRYPTO_ALIASES[cm.group(1).lower()]
+    return None
+
+
+_CRYPTO_INTENT_PROMPT = """\
+Uživatel napsal zprávu v konverzaci s AI asistentkou.
+Zjisti, jestli se uživatel ptá na aktuální cenu, kurz nebo tržní hodnotu kryptoměny.
+
+Odpověz POUZE jedním slovem:
+- "ano" pokud se ptá na cenu/kurz/hodnotu kryptoměny (i nepřímo, např. "jak je na tom bitcoin", "co dělá ethereum")
+- "ne" pokud se neptá na cenu (např. "co je bitcoin", "vysvětli mi blockchain", běžná konverzace)
+
+Zpráva: {text}"""
+
+
+async def detect_crypto_request_llm(text: str) -> str | None:
+    """LLM fallback for crypto detection when regex fails but crypto is mentioned.
+
+    Only called when:
+    1. detect_crypto_request() returned None (regex didn't match)
+    2. _find_crypto_mention() found a crypto name in the text
+
+    Returns CoinGecko coin ID or None.
+    """
+    from chat_engine import get_auxiliary_response
+
+    coin_id = _find_crypto_mention(text)
+    if not coin_id:
+        return None
+
+    try:
+        messages = [
+            {"role": "user", "content": _CRYPTO_INTENT_PROMPT.format(text=text)},
+        ]
+        response = await get_auxiliary_response(messages)
+        answer = response.strip().lower()
+        logger.debug("Crypto LLM intent for '%s': %s → %s", text[:50], answer, coin_id)
+
+        if answer.startswith("ano"):
+            logger.info("Crypto LLM fallback detected: %s → %s", text[:50], coin_id)
+            return coin_id
+
+    except Exception as e:
+        logger.warning("Crypto LLM fallback failed: %s", e)
 
     return None
 
