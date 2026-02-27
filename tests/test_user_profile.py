@@ -159,3 +159,69 @@ def test_observations_deduplication(profile):
     patterns = full["eigy_observations"]["behavioral_patterns"]
     assert patterns.count("rád vtipkuje") == 1
     assert "píše krátce" in patterns
+
+
+def test_people_extraction_new_person(profile):
+    """Test that a new person is added to the people section."""
+    data = {
+        "people": {
+            "Robert": {
+                "relation": "strýc",
+                "notes": ["zručný", "rád jezdí do lesa"],
+                "location": "Hejnice u Žamberka",
+            }
+        }
+    }
+    profile.update_from_extraction(data)
+
+    full = profile.get_full_profile()
+    assert "Robert" in full["people"]
+    assert full["people"]["Robert"]["relation"] == "strýc"
+    assert "zručný" in full["people"]["Robert"]["notes"]
+    assert full["people"]["Robert"]["location"] == "Hejnice u Žamberka"
+
+
+def test_people_merge_existing_person(profile):
+    """Test that new info about an existing person is merged."""
+    data1 = {
+        "people": {
+            "Robert": {
+                "relation": "strýc",
+                "notes": ["zručný"],
+            }
+        }
+    }
+    data2 = {
+        "people": {
+            "Robert": {
+                "notes": ["zručný", "rád jezdí do lesa"],
+                "location": "Hejnice u Žamberka",
+            }
+        }
+    }
+    profile.update_from_extraction(data1)
+    profile.update_from_extraction(data2)
+
+    full = profile.get_full_profile()
+    robert = full["people"]["Robert"]
+    assert robert["relation"] == "strýc"
+    assert robert["notes"].count("zručný") == 1  # deduplicated
+    assert "rád jezdí do lesa" in robert["notes"]
+    assert robert["location"] == "Hejnice u Žamberka"
+
+
+def test_people_multiple_persons(profile):
+    """Test that multiple people can be stored."""
+    data = {
+        "people": {
+            "Robert": {"relation": "strýc", "notes": ["zručný"]},
+            "Vlaďka": {"relation": "teta", "notes": ["bydlí ve statku"]},
+            "Jindřich": {"relation": "kamarád strýce Roberta", "notes": ["přezdívka Pinďa"]},
+        }
+    }
+    profile.update_from_extraction(data)
+
+    full = profile.get_full_profile()
+    assert len(full["people"]) == 3
+    assert full["people"]["Vlaďka"]["relation"] == "teta"
+    assert "přezdívka Pinďa" in full["people"]["Jindřich"]["notes"]

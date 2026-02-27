@@ -29,7 +29,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4")
-AUX_MODEL = os.getenv("AUX_MODEL", "google/gemini-2.5-flash-preview")
+AUX_MODEL = os.getenv("AUX_MODEL", "google/gemini-2.5-flash")
 
 # ── TTS ────────────────────────────────────────────────────────────
 

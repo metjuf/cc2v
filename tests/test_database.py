@@ -119,3 +119,39 @@ def test_previous_session_messages(db):
     assert len(msgs) == 2
     assert msgs[0]["content"] == "Ahoj"
     assert msgs[1]["content"] == "Čau"
+
+
+def test_profile_summary_people(db):
+    """People section appears in profile summary."""
+    profile = db.get_structured_profile()
+    profile["basic"]["name"] = "Matouš"
+    profile["people"] = {
+        "Robert": {
+            "relation": "strýc",
+            "notes": ["zručný", "rád jezdí do lesa"],
+            "location": "Hejnice u Žamberka",
+        },
+        "Jindřich": {
+            "relation": "kamarád strýce Roberta",
+            "notes": ["přezdívka Pinďa"],
+        },
+    }
+    db.save_structured_profile(profile)
+
+    summary = db.get_user_profile_summary()
+    assert "Lidé:" in summary
+    assert "Robert (strýc)" in summary
+    assert "Hejnice u Žamberka" in summary
+    assert "Jindřich" in summary
+    assert "Pinďa" in summary
+
+
+def test_profile_summary_people_empty(db):
+    """Empty people section does not appear in summary."""
+    profile = db.get_structured_profile()
+    profile["basic"]["name"] = "Jan"
+    profile["people"] = {}
+    db.save_structured_profile(profile)
+
+    summary = db.get_user_profile_summary()
+    assert "Lidé:" not in summary

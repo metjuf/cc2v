@@ -50,6 +50,53 @@ class UserProfile:
         """Human-readable summary of everything known about the user."""
         return self.db.get_user_profile_summary()
 
+    @staticmethod
+    def _guard_field(
+        data: dict, profile: dict,
+        section: str, key: str, sub_key: str | None = None,
+    ) -> None:
+        """Block extraction from overwriting an existing identity field.
+
+        Prevents LLM from confusing mentioned person's info with user's info.
+        For nested fields (e.g. location.city), use sub_key.
+        """
+        if section not in data or not isinstance(data[section], dict):
+            return
+        existing_section = profile.get(section, {})
+        if not isinstance(existing_section, dict):
+            return
+
+        if sub_key:
+            # Nested: e.g. basic.location.city
+            existing_val = existing_section.get(key, {})
+            if isinstance(existing_val, dict) and existing_val.get(sub_key):
+                extracted = data[section].get(key, {})
+                if isinstance(extracted, dict) and extracted.get(sub_key):
+                    if extracted[sub_key] != existing_val[sub_key]:
+                        logger.info(
+                            "Blocked %s.%s.%s overwrite: '%s' → '%s'",
+                            section, key, sub_key,
+                            existing_val[sub_key], extracted[sub_key],
+                        )
+                        del extracted[sub_key]
+                        if not extracted:
+                            del data[section][key]
+        else:
+            # Simple: e.g. basic.name, life.occupation
+            existing_val = existing_section.get(key)
+            if existing_val:
+                extracted_val = data[section].get(key)
+                if extracted_val and extracted_val != existing_val:
+                    logger.info(
+                        "Blocked %s.%s overwrite: '%s' → '%s'",
+                        section, key, existing_val, extracted_val,
+                    )
+                    del data[section][key]
+
+        # Clean up empty section
+        if section in data and not data[section]:
+            del data[section]
+
     def update_from_extraction(self, data: dict) -> None:
         """Apply auto-extracted profile updates from LLM.
 
@@ -59,9 +106,15 @@ class UserProfile:
         """
         profile = self._load()
 
+        # Protect key identity fields from being overwritten by extraction
+        # (LLM sometimes confuses mentioned person's info with user's info)
+        self._guard_field(data, profile, "basic", "name")
+        self._guard_field(data, profile, "life", "occupation")
+        self._guard_field(data, profile, "basic", "location", sub_key="city")
+
         # Detect format: if top-level keys match structured categories, use deep merge
         structured_keys = {"basic", "personality", "life", "interests", "preferences",
-                           "goals", "health", "context", "eigy_observations"}
+                           "goals", "health", "context", "eigy_observations", "people"}
         if any(k in data for k in structured_keys):
             changelog = profile.get("_changelog", [])
             old_len = len(changelog)

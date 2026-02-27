@@ -55,6 +55,13 @@ Vrať validní JSON se strukturovanými kategoriemi (uveď pouze pokud je nová 
     "communication_notes": [],
     "personal_insights": [],
     "relationship_notes": []
+  }},
+  "people": {{
+    "Jméno osoby": {{
+      "relation": "vztah k uživateli (strýc, teta, kamarád, kolega, soused...)",
+      "notes": ["důležité informace o této osobě"],
+      "location": "kde bydlí nebo pracuje (volitelné)"
+    }}
   }}
 }}
 
@@ -62,8 +69,11 @@ Pravidla:
 - Uveď POUZE klíče, které obsahují nové informace. Ostatní klíče vynech.
 - Nezahrnuj informace, které jsou již v existujícím profilu.
 - Pole plň jen pokud je nová hodnota. Nevracej prázdné seznamy ani null hodnoty.
+- DŮLEŽITÉ: basic.name je jméno UŽIVATELE, nikoli osoby, o které mluví. Pokud uživatel mluví o jiné osobě (strýc Robert, kamarád Jan...), NEZAPISUJ její jméno do basic.name. Jméno uživatele měň POUZE pokud uživatel výslovně řekne "jmenuju se..." nebo "jsem...".
+- Informace o jiných osobách (rodina, kamarádi, kolegové) VŽDY zapiš do sekce "people", NIKDY do basic/life.
 - misc_facts použij pro cokoli, co nezapadá do jiné kategorie.
 - eigy_observations: jen opravdu zajímavé postřehy o vzorcích chování a komunikace uživatele.
+- people: zaznamenej KAŽDOU osobu, o které uživatel mluví — rodinu, kamarády, kolegy, známé. Klíč = křestní jméno osoby. Uveď relation (strýc, teta, kamarád, kolega...), notes (zajímavé info o osobě — vlastnosti, zvyky, problémy, přezdívky, vztahy k dalším lidem), location (volitelné). Pokud uživatel zmíní kamaráda někoho jiného, zapiš to do notes té osoby NEBO vytvoř nový záznam s relation "kamarád strýce Roberta" apod.
 
 Existující profil: {current_profile}
 
@@ -72,7 +82,7 @@ Vrať POUZE validní JSON, žádný jiný text.\
 
 REALTIME_EXTRACTION_PROMPT = """\
 Z této výměny zpráv extrahuj NOVÉ osobní informace o uživateli.
-Zaměř se na: jméno, věk, zájmy, rodinu, práci, vzdělání, kde bydlí, preference, návyky, cíle.
+Zaměř se na: jméno, věk, zájmy, rodinu, práci, vzdělání, kde bydlí, preference, návyky, cíle, LIDI z okolí uživatele (rodina, kamarádi, kolegové, známí).
 Navíc si všímej vzorců chování a komunikace uživatele.
 
 Existující profil: {current_profile}
@@ -91,13 +101,23 @@ Vrať POUZE validní JSON se strukturovanými kategoriemi (jen ty, kde máš nov
     "behavioral_patterns": [],
     "communication_notes": [],
     "personal_insights": []
+  }},
+  "people": {{
+    "Jméno": {{"relation": "vztah k uživateli", "notes": ["důležité info"]}}
   }}
 }}
+
+DŮLEŽITÉ: basic.name je jméno UŽIVATELE. Pokud uživatel mluví o jiné osobě (strýc, kamarád, kolega...), NEZAPISUJ její jméno do basic.name — zapiš ji do "people". Jméno uživatele měň jen pokud výslovně řekne "jmenuju se..." nebo "jsem...".
 
 Pravidla pro eigy_observations:
 - Zapiš jen opravdu zajímavé postřehy, ne triviální věci
 - Formuluj jako: "uživatel má tendenci...", "reaguje dobře na...", "zdá se, že..."
 - Maximálně 1-2 postřehy za výměnu
+
+Pravidla pro people:
+- Zaznamenej každou osobu, o které uživatel mluví — rodinu, kamarády, kolegy, známé
+- Klíč = křestní jméno, relation = vztah k uživateli, notes = důležité info
+- Informace o jiných lidech (práce, bydliště, vlastnosti) PATŘÍ do people, NE do basic/life
 
 Pokud nic nového, vrať: {{}}\
 """

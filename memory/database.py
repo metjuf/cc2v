@@ -58,6 +58,7 @@ _DEFAULT_PROFILE = {
         "personal_insights": [],
         "relationship_notes": [],
     },
+    "people": {},
 }
 
 
@@ -326,6 +327,28 @@ class Database:
             pets = self._safe_list(fam.get("pets"))
             if pets:
                 parts.append(f"Mazlíčci: {', '.join(pets)}")
+
+        people = profile.get("people", {})
+        if isinstance(people, dict) and people:
+            people_parts = []
+            for name, info in list(people.items())[:15]:
+                if not isinstance(info, dict):
+                    continue
+                relation = info.get("relation", "")
+                notes = self._safe_list(info.get("notes"))
+                location = info.get("location", "")
+                desc = str(name)
+                if relation:
+                    desc += f" ({relation})"
+                details = []
+                if location:
+                    details.append(str(location))
+                details.extend(notes[:3])
+                if details:
+                    desc += f" — {'; '.join(details)}"
+                people_parts.append(desc)
+            if people_parts:
+                parts.append(f"Lidé: {' | '.join(people_parts)}")
 
         personality = profile.get("personality", {})
         if isinstance(personality, dict):
