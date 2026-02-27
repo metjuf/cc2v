@@ -57,6 +57,13 @@ _EXCLUDE_PATTERNS = [
         r"^pomoz\s+mi\s+(?:s\s+)?(?:kódem|programem|úkolem|prací)",
         r"^(?:nastav|zapni|vypni|přepni|změň)",
         r"^jak\s+se\s+(?:jmenuješ|máš)",
+        # Time/date questions — handled by temporal awareness, no search needed
+        r"kolik\s+je\s+(?:hodin|ted\s+hodin|teď\s+hodin)",
+        r"(?:jaký|jaky|jakej)\s+je\s+(?:den|datum|dnes|měsíc|mesic|rok|čas|cas)",
+        r"(?:co\s+je\s+)?za\s+den",
+        r"(?:kolikátého|kolikateho|kolikáteho)\s+(?:je|dnes)",
+        r"(?:řekni|pověz|muzes\s+mi\s+říct|můžeš\s+mi\s+říct).*kolik\s+je\s+hodin",
+        r"(?:řekni|pověz|muzes\s+mi\s+říct|můžeš\s+mi\s+říct).*(?:jaký|jaky)\s+je\s+den",
     ]
 ]
 

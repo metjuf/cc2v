@@ -7,7 +7,7 @@ from memory.database import Database
 
 def test_schema_version(db):
     row = db.conn.execute("SELECT version FROM schema_version").fetchone()
-    assert row["version"] == 3
+    assert row["version"] == 4
 
 
 def test_create_conversation(db):
@@ -155,3 +155,51 @@ def test_profile_summary_people_empty(db):
 
     summary = db.get_user_profile_summary()
     assert "Lidé:" not in summary
+
+
+# ── Bookmark tests ───────────────────────────────────────────────
+
+
+def test_bookmark_save_and_get(db):
+    """Save and retrieve a bookmark."""
+    db.save_bookmark("slova", 5, 120)
+
+    bm = db.get_bookmark("slova")
+    assert bm is not None
+    assert bm["book_name"] == "slova"
+    assert bm["current_page"] == 5
+    assert bm["total_pages"] == 120
+
+
+def test_bookmark_update(db):
+    """Updating an existing bookmark overwrites page number."""
+    db.save_bookmark("slova", 5, 120)
+    db.save_bookmark("slova", 42, 120)
+
+    bm = db.get_bookmark("slova")
+    assert bm["current_page"] == 42
+
+
+def test_bookmark_delete(db):
+    """Delete returns True if existed, False otherwise."""
+    db.save_bookmark("slova", 10, 120)
+
+    assert db.delete_bookmark("slova") is True
+    assert db.get_bookmark("slova") is None
+    assert db.delete_bookmark("slova") is False
+
+
+def test_bookmark_get_nonexistent(db):
+    """Getting a nonexistent bookmark returns None."""
+    assert db.get_bookmark("neexistuje") is None
+
+
+def test_bookmark_get_all(db):
+    """Get all bookmarks."""
+    db.save_bookmark("slova", 5, 120)
+    db.save_bookmark("duna", 100, 400)
+
+    all_bm = db.get_all_bookmarks()
+    assert len(all_bm) == 2
+    names = {b["book_name"] for b in all_bm}
+    assert names == {"slova", "duna"}

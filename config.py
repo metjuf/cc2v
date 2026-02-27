@@ -109,6 +109,11 @@ PROACTIVE_IDLE_TIMEOUT = int(os.getenv("PROACTIVE_IDLE_TIMEOUT", "120"))
 PROACTIVE_TIER2_TIMEOUT = int(os.getenv("PROACTIVE_TIER2_TIMEOUT", "720"))
 PROACTIVE_SHUTDOWN_TIMEOUT = int(os.getenv("PROACTIVE_SHUTDOWN_TIMEOUT", "1200"))
 
+# ── Book Reader ──────────────────────────────────────────────────
+
+BOOKS_DIR = PROJECT_ROOT / os.getenv("BOOKS_DIR", "data/books")
+BOOK_PROGRESS_INTERVAL = int(os.getenv("BOOK_PROGRESS_INTERVAL", "10"))
+
 # ── Eigy System Prompt ────────────────────────────────────────────
 
 SYSTEM_PROMPT_TEMPLATE = """\

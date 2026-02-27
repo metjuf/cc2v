@@ -166,6 +166,7 @@ class SessionLogger:
         total_tokens: int,
         trimmed: bool = False,
         tokens_before: int | None = None,
+        style_hint: str | None = None,
     ) -> None:
         """Log context building result."""
         data: dict = {
@@ -175,6 +176,8 @@ class SessionLogger:
         }
         if tokens_before is not None:
             data["tokens_before"] = tokens_before
+        if style_hint:
+            data["style_hint"] = style_hint
         self.log("context_built", **data)
 
     def log_extraction(self, keys_found: list[str]) -> None:

@@ -30,6 +30,7 @@ from web_search import (
 )
 from tts_engine import TTSEngine, SentenceBuffer, cleanup_temp_files
 from audio_player import AudioPlayer
+from book_reader import find_book, parse_epub, book_reading_task, BookInfo
 from imessage_bot import MessagesDB, IMessage, send_imessage, ContactBook
 
 # Episodic memory (optional dependency)
@@ -381,6 +382,196 @@ def detect_imessage_command(text: str) -> tuple[str, str] | None:
         return ("list_contacts", "")
 
     return None
+
+
+# ── Book reader commands ─────────────────────────────────────────
+
+_BOOK_READ_RE = re.compile(
+    r"^(?:čti|přečti|pokračuj\s+(?:v\s+)?(?:čtení|četbě))\s+(?:knihu?\s+)?(.+)$",
+    re.IGNORECASE,
+)
+_BOOK_STOP_RE = re.compile(
+    r"^(?:zastav|stop|přestaň|pozastav)\s+(?:čtení|četbu)$",
+    re.IGNORECASE,
+)
+_BOOK_DELETE_RE = re.compile(
+    r"^(?:vymaž|smaž|odstraň)\s+záložku\s+(.+)$",
+    re.IGNORECASE,
+)
+
+
+def detect_book_command(text: str) -> tuple[str, str] | None:
+    """Detect book reader command. Returns (cmd, arg) or None."""
+    text = text.strip()
+
+    m = _BOOK_READ_RE.match(text)
+    if m:
+        return ("read", m.group(1).strip())
+
+    if _BOOK_STOP_RE.match(text):
+        return ("stop", "")
+
+    m = _BOOK_DELETE_RE.match(text)
+    if m:
+        return ("delete", m.group(1).strip())
+
+    return None
+
+
+async def _stop_book_reading(
+    reading_state: dict,
+    audio_player: AudioPlayer,
+) -> int | None:
+    """Cancel an active book reading task. Returns last page or None."""
+    if not reading_state.get("task"):
+        return None
+
+    cancel_event = reading_state.get("cancel_event")
+    task = reading_state["task"]
+
+    if cancel_event:
+        cancel_event.set()
+    audio_player.stop()
+
+    # Wait briefly for the task to finish
+    try:
+        await asyncio.wait_for(task, timeout=3.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        task.cancel()
+
+    last_page = reading_state.get("current_page", 0)
+    reading_state.clear()
+    return last_page
+
+
+async def handle_book_command(
+    cmd: str,
+    arg: str,
+    db: Database,
+    memory: MemoryManager,
+    tts: TTSEngine,
+    audio_player: AudioPlayer,
+    avatar_queue: queue.Queue,
+    event_queue: asyncio.Queue,
+    current_messages: list[dict],
+    reading_state: dict,
+    slog: SessionLogger | None = None,
+) -> None:
+    """Handle book reader commands (read/stop/delete)."""
+
+    if cmd == "read":
+        book_name = arg
+
+        # Find the EPUB file
+        path = find_book(book_name)
+        if not path:
+            display.show_system(
+                f"Kniha '{book_name}' nenalezena v {config.BOOKS_DIR}/"
+            )
+            return
+
+        # Stop any existing reading
+        await _stop_book_reading(reading_state, audio_player)
+
+        # Parse the book
+        try:
+            book = parse_epub(path)
+        except Exception as e:
+            display.show_error(f"Nepodařilo se načíst knihu: {e}")
+            logger.error("EPUB parse failed: %s", e)
+            return
+
+        # Load or create bookmark
+        bookmark = db.get_bookmark(book_name.lower())
+        start_page = bookmark["current_page"] if bookmark else 0
+
+        # If already finished, start from beginning
+        if start_page >= book.total_pages:
+            start_page = 0
+
+        # Announce
+        if start_page > 0:
+            msg = (
+                f"Pokračuji ve čtení '{book.title}' "
+                f"od stránky {start_page + 1} z {book.total_pages}."
+            )
+        else:
+            msg = (
+                f"Začínám číst '{book.title}' — "
+                f"{book.total_pages} stránek."
+            )
+
+        display.show_assistant(msg)
+        current_messages.append({"role": "assistant", "content": msg})
+        memory.save_message("assistant", msg)
+        await _speak(msg, tts, audio_player, avatar_queue)
+
+        # Set up reading state
+        cancel_event = asyncio.Event()
+
+        def update_bookmark(page: int) -> None:
+            reading_state["current_page"] = page
+            db.save_bookmark(book_name.lower(), page, book.total_pages)
+
+        # Save initial bookmark
+        db.save_bookmark(book_name.lower(), start_page, book.total_pages)
+
+        # Launch background reading task
+        task = asyncio.create_task(
+            book_reading_task(
+                book=book,
+                start_page=start_page,
+                tts=tts,
+                audio_player=audio_player,
+                event_queue=event_queue,
+                cancel_event=cancel_event,
+                update_bookmark=update_bookmark,
+            )
+        )
+
+        reading_state["task"] = task
+        reading_state["cancel_event"] = cancel_event
+        reading_state["book"] = book
+        reading_state["current_page"] = start_page
+        reading_state["book_name"] = book_name.lower()
+
+        if slog:
+            slog.log("book_start", title=book.title, page=start_page, total=book.total_pages)
+
+    elif cmd == "stop":
+        if not reading_state.get("task"):
+            display.show_system("Momentálně nic nečtu.")
+            return
+
+        book = reading_state.get("book")
+        last_page = await _stop_book_reading(reading_state, audio_player)
+
+        title = book.title if book else "knihu"
+        total = book.total_pages if book else "?"
+        msg = f"Zastavila jsem čtení '{title}' na stránce {last_page} z {total}."
+
+        display.show_assistant(msg)
+        current_messages.append({"role": "assistant", "content": msg})
+        memory.save_message("assistant", msg)
+
+        if slog:
+            slog.log("book_stop", title=title, page=last_page)
+
+    elif cmd == "delete":
+        book_name = arg
+        existed = db.delete_bookmark(book_name.lower())
+
+        if existed:
+            msg = f"Záložka pro '{book_name}' smazána."
+        else:
+            msg = f"Žádná záložka pro '{book_name}' neexistuje."
+
+        display.show_assistant(msg)
+        current_messages.append({"role": "assistant", "content": msg})
+        memory.save_message("assistant", msg)
+
+        if slog:
+            slog.log("book_delete_bookmark", book_name=book_name, existed=existed)
 
 
 async def handle_imessage_command(
@@ -750,6 +941,7 @@ async def chat_loop(
     display.show_system("Napiš /help pro příkazy, 'exit' pro ukončení.")
 
     ongoing_input_task: asyncio.Task | None = None
+    reading_state: dict = {}  # Active book reading task state
 
     try:
         while True:
@@ -761,7 +953,15 @@ async def chat_loop(
             if action_type == "input":
                 user_input = payload
                 idle_monitor.reset()
-                audio_player.stop()  # interrupt any playing speech
+
+                # Decide whether to stop book reading on this input.
+                # Slash commands and book commands don't interrupt reading.
+                _is_slash = isinstance(user_input, str) and user_input.startswith("/")
+                _is_book_cmd = isinstance(user_input, str) and detect_book_command(user_input) is not None
+                if reading_state.get("task") and not _is_slash and not _is_book_cmd:
+                    await _stop_book_reading(reading_state, audio_player)
+                elif not reading_state.get("task"):
+                    audio_player.stop()  # interrupt any playing speech
 
                 if user_input is None:
                     break  # EOF / Ctrl+D
@@ -795,6 +995,17 @@ async def chat_loop(
                         imsg_cmd[0], imsg_cmd[1],
                         imessage_db_holder[0], imessage_cache,
                         imessage_contacts,
+                    )
+                    continue
+
+                # Book reader commands (čti knihu X, zastav čtení, vymaž záložku X)
+                book_cmd = detect_book_command(user_input)
+                if book_cmd:
+                    await handle_book_command(
+                        book_cmd[0], book_cmd[1],
+                        db, memory, tts, audio_player,
+                        avatar_queue, event_queue, current_messages,
+                        reading_state, slog,
                     )
                     continue
 
@@ -870,6 +1081,7 @@ async def chat_loop(
                     slog.log_context_built(
                         num_messages=len(messages),
                         total_tokens=ctx_tokens,
+                        style_hint=memory.last_style_hint,
                     )
 
                 # Inject crypto price data
@@ -996,6 +1208,9 @@ async def chat_loop(
                 )
 
             elif action_type == "idle_trigger":
+                # Suppress proactive messages while reading a book
+                if reading_state.get("task"):
+                    continue
                 # Tiered idle — tier 1 = casual check-in, tier 2 = pre-shutdown notice
                 tier = payload.get("tier", 1)
                 if slog:
@@ -1006,6 +1221,9 @@ async def chat_loop(
                 )
 
             elif action_type == "idle_shutdown":
+                # Don't auto-shutdown while reading a book
+                if reading_state.get("task"):
+                    continue
                 # Auto-shutdown after prolonged inactivity
                 farewell = SHUTDOWN_MESSAGE.format(user_name=memory.user_name)
                 display.show_assistant(farewell)
@@ -1031,6 +1249,30 @@ async def chat_loop(
                         avatar_queue, current_messages,
                     )
 
+            elif action_type == "book_progress":
+                # Book reading progress update
+                title = payload.get("title", "?")
+                page = payload.get("page", 0)
+                total = payload.get("total", 0)
+                msg = f"Čtu ti '{title}', stránka {page} z {total}."
+                display.show_system(msg)
+                current_messages.append({"role": "assistant", "content": msg})
+                memory.save_message("assistant", msg)
+                if slog:
+                    slog.log("book_progress", title=title, page=page, total=total)
+
+            elif action_type == "book_finished":
+                # Book reading completed
+                title = payload.get("title", "?")
+                total = payload.get("total", 0)
+                msg = f"Dočetla jsem '{title}' — {total} stránek."
+                display.show_assistant(msg)
+                current_messages.append({"role": "assistant", "content": msg})
+                memory.save_message("assistant", msg)
+                reading_state.clear()
+                if slog:
+                    slog.log("book_finished", title=title, total=total)
+
     finally:
         # Cancel pending input task — don't await it because
         # prompt_toolkit's blocking prompt() can't be interrupted.
@@ -1043,6 +1285,11 @@ async def chat_loop(
         idle_monitor.stop()
         idle_task.cancel()
         imessage_watcher_task.cancel()
+        # Stop book reading if active
+        if reading_state.get("cancel_event"):
+            reading_state["cancel_event"].set()
+        if reading_state.get("task") and not reading_state["task"].done():
+            reading_state["task"].cancel()
         if imessage_db_holder[0] is not None:
             imessage_db_holder[0].close()
         try:

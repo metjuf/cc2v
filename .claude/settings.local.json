@@ -64,7 +64,9 @@
       "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/pip install ddgs)",
       "Bash(/Users/metjuf/Documents/GitHub/cc2v/venv/bin/python -c \"import ddgs; help\\(ddgs.DDGS.text\\)\")",
       "Bash(/Users/metjuf/VS_projects/cc2v/venv/bin/python -c \"import ddgs; print\\(dir\\(ddgs\\)\\)\")",
-      "Bash(/Users/metjuf/VS_projects/cc2v/venv/bin/python -c \":*)"
+      "Bash(/Users/metjuf/VS_projects/cc2v/venv/bin/python -c \":*)",
+      "Bash(# Check if extraction works in latest session \\(86\\) — after model fix grep \"\"extraction\\\\|Extraction\\\\|extract\"\" /Users/metjuf/Documents/GitHub/cc2v/data/logs/eigy.jsonl)",
+      "Bash(python -m pytest tests/ -v --tb=short)"
     ]
   }
 }

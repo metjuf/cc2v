@@ -65,7 +65,7 @@ _DEFAULT_PROFILE = {
 class Database:
     """SQLite database for Eigy's persistent memory."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -116,6 +116,15 @@ class Database:
                 profile_json TEXT NOT NULL,
                 created_at TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_name TEXT NOT NULL UNIQUE,
+                current_page INTEGER DEFAULT 0,
+                total_pages INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         # Set schema version if not present
         existing = cursor.execute("SELECT version FROM schema_version").fetchone()
@@ -135,6 +144,8 @@ class Database:
             self._migrate_v1_to_v2()
         if current_version < 3:
             self._migrate_v2_to_v3()
+        if current_version < 4:
+            self._migrate_v3_to_v4()
 
         if current_version < self.SCHEMA_VERSION:
             self.conn.execute(
@@ -188,6 +199,20 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 profile_json TEXT NOT NULL,
                 created_at TIMESTAMP
+            )
+        """)
+        self.conn.commit()
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Add bookmarks table for book reader."""
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_name TEXT NOT NULL UNIQUE,
+                current_page INTEGER DEFAULT 0,
+                total_pages INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         self.conn.commit()
@@ -484,6 +509,53 @@ class Database:
         ).fetchall()
         return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
 
+    # ── Bookmarks (Book Reader) ──────────────────────────────────
+
+    def get_bookmark(self, book_name: str) -> dict | None:
+        """Get bookmark for a book. Returns dict or None."""
+        row = self.conn.execute(
+            "SELECT book_name, current_page, total_pages FROM bookmarks WHERE book_name = ?",
+            (book_name,),
+        ).fetchone()
+        if row:
+            return {
+                "book_name": row["book_name"],
+                "current_page": row["current_page"],
+                "total_pages": row["total_pages"],
+            }
+        return None
+
+    def save_bookmark(self, book_name: str, current_page: int, total_pages: int) -> None:
+        """Upsert bookmark for a book."""
+        self.conn.execute(
+            """INSERT INTO bookmarks (book_name, current_page, total_pages, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(book_name) DO UPDATE SET
+                   current_page = excluded.current_page,
+                   total_pages = excluded.total_pages,
+                   updated_at = excluded.updated_at""",
+            (book_name, current_page, total_pages, _now()),
+        )
+        self.conn.commit()
+
+    def delete_bookmark(self, book_name: str) -> bool:
+        """Delete bookmark. Returns True if it existed."""
+        cursor = self.conn.execute(
+            "DELETE FROM bookmarks WHERE book_name = ?", (book_name,)
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_all_bookmarks(self) -> list[dict]:
+        """Get all bookmarks."""
+        rows = self.conn.execute(
+            "SELECT book_name, current_page, total_pages FROM bookmarks ORDER BY updated_at DESC"
+        ).fetchall()
+        return [
+            {"book_name": r["book_name"], "current_page": r["current_page"], "total_pages": r["total_pages"]}
+            for r in rows
+        ]
+
     # ── Maintenance ────────────────────────────────────────────────
 
     def clear_all(self) -> None:
@@ -494,6 +566,7 @@ class Database:
             DELETE FROM user_profile;
             DELETE FROM user_profile_v2;
             DELETE FROM profile_snapshots;
+            DELETE FROM bookmarks;
         """)
         self.conn.commit()
 

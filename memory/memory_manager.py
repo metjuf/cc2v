@@ -293,17 +293,30 @@ class MemoryManager:
             "</eigy_observations>"
         )
 
+    _STYLE_DIRECTIVES: dict[str, str] = {
+        "KRATCE": "Odpověz MAXIMÁLNĚ 1-2 větami. Nic víc.",
+        "ROZVIN": "Rozviň odpověď trochu víc než obvykle.",
+        "BEZ_OTAZKY": "Nekončí otázkou. Prostě dokonči myšlenku.",
+        "OTAZKA": "Zkus zakončit otázkou.",
+    }
+
     def _compute_style_hint(self, current_messages: list[dict]) -> str | None:
-        """Compute a response style hint based on recent conversation flow."""
+        """Compute a single response style directive based on conversation flow.
+
+        Returns at most ONE short, forceful instruction — multiple hints
+        dilute each other and get ignored by the model.
+        """
+        import random
+
         if len(current_messages) < 4:
             return None
 
         recent_assistant = [
-            m for m in current_messages[-6:]
+            m for m in current_messages[-8:]
             if m["role"] == "assistant"
         ]
         recent_user = [
-            m for m in current_messages[-6:]
+            m for m in current_messages[-8:]
             if m["role"] == "user"
         ]
 
@@ -317,25 +330,47 @@ class MemoryManager:
             sum(len(m["content"]) for m in recent_user) / len(recent_user)
             if recent_user else 0
         )
+        assistant_count = len(recent_assistant)
+        last_3_lens = [len(m["content"]) for m in recent_assistant[-3:]]
 
-        hints = []
+        # Priority order — return the FIRST match only.
 
+        # 1. User writes short, assistant way too verbose → strongest signal
+        if avg_user_len < 50 and avg_assistant_len > 200:
+            return "KRATCE"
+
+        # 2. All last 3 responses long and similar → monotony
+        if (len(last_3_lens) >= 3
+                and all(l > 200 for l in last_3_lens)):
+            return "KRATCE"
+
+        # 3. Monotony — similar lengths (any range)
+        if len(last_3_lens) >= 3:
+            mid = sum(last_3_lens) / 3
+            if mid > 0 and all(abs(l - mid) / mid < 0.25 for l in last_3_lens):
+                if mid > 150:
+                    return "KRATCE"
+                else:
+                    return "ROZVIN"
+
+        # 4. Too many questions in a row
         if (len(recent_assistant) >= 3
-                and all(len(m["content"]) < 80 for m in recent_assistant[-3:])):
-            hints.append("Poslední odpovědi byly krátké — zkus být trochu rozvláčnější nebo přidat detail.")
+                and all("?" in m["content"][-50:]
+                        for m in recent_assistant[-3:])):
+            return "BEZ_OTAZKY"
 
-        if (len(recent_assistant) >= 3
-                and all(len(m["content"]) > 300 for m in recent_assistant[-3:])):
-            hints.append("Poslední odpovědi byly dlouhé — zkus být stručnější.")
+        # 5. Random variator — every ~3rd message, 50% chance brevity nudge
+        if assistant_count >= 3 and assistant_count % 3 == 0:
+            if random.random() < 0.5:
+                return "KRATCE"
 
-        if avg_user_len < 30 and avg_assistant_len > 200:
-            hints.append("Uživatel píše krátce — přizpůsob délku odpovědi.")
+        # 6. No questions in a while → suggest one
+        if (len(recent_assistant) >= 4
+                and not any("?" in m["content"]
+                            for m in recent_assistant[-4:])):
+            return "OTAZKA"
 
-        if (len(recent_assistant) >= 3
-                and not any("?" in m["content"] for m in recent_assistant[-3:])):
-            hints.append("Zkus zakončit otázkou nebo nabídnout další téma.")
-
-        return " ".join(hints) if hints else None
+        return None
 
     async def generate_pre_reasoning(
         self,
@@ -520,14 +555,22 @@ class MemoryManager:
         # 5. Current session messages
         context.extend(current_messages)
 
-        # 5.5. Response style hint (inserted before last message)
+        # 5.5. Response style hint (appended to last user message)
+        self.last_style_hint = None
         if config.STYLE_VARIATION_ENABLED:
             style_hint = self._compute_style_hint(current_messages)
             if style_hint:
-                context.insert(-1, {
-                    "role": "system",
-                    "content": f"<response_style_hint>\n{style_hint}\n</response_style_hint>",
-                })
+                self.last_style_hint = style_hint
+                directive = self._STYLE_DIRECTIVES.get(style_hint)
+                if directive and context and context[-1]["role"] == "user":
+                    context[-1] = {
+                        **context[-1],
+                        "content": (
+                            f"{context[-1]['content']}\n\n"
+                            f"[Styl odpovědi: {directive}]"
+                        ),
+                    }
+                self._debug(f"Style hint: {style_hint}")
 
         # 5.6. Internal reasoning (chain-of-thought, inserted before last message)
         if internal_reasoning:
@@ -575,8 +618,7 @@ class MemoryManager:
 
         # (prefix, priority, per-layer budget) — lower priority = trimmed first
         trim_rules = [
-            ("<response_style_hint>", 1, 200),
-            ("<internal_reasoning>", 2, 500),
+            ("<internal_reasoning>", 1, 500),
             ("<eigy_observations>", 3, 300),
             ("<user_mood", 4, 100),
             ("<current_time>", 5, 100),

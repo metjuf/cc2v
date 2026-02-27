@@ -238,18 +238,44 @@ def test_mood_to_guidance():
 # ── Style variation tests ────────────────────────────────────────
 
 
-def test_compute_style_hint_short_messages(manager):
+def test_compute_style_hint_user_short_assistant_verbose(manager):
+    """When user writes short but assistant is verbose, return KRATCE."""
     msgs = [
         {"role": "user", "content": "ahoj"},
-        {"role": "assistant", "content": "čau"},
+        {"role": "assistant", "content": "x" * 250},
         {"role": "user", "content": "ok"},
-        {"role": "assistant", "content": "fajn"},
+        {"role": "assistant", "content": "y" * 220},
         {"role": "user", "content": "díky"},
-        {"role": "assistant", "content": "rádo se stalo"},
+        {"role": "assistant", "content": "z" * 210},
     ]
-    hint = manager._compute_style_hint(msgs)
-    assert hint is not None
-    assert "rozvláčnější" in hint or "otázkou" in hint
+    assert manager._compute_style_hint(msgs) == "KRATCE"
+
+
+def test_compute_style_hint_monotony_long(manager):
+    """Detects monotonous long responses — returns KRATCE."""
+    msgs = [
+        {"role": "user", "content": "ahoj"},
+        {"role": "assistant", "content": "x" * 250},
+        {"role": "user", "content": "ok"},
+        {"role": "assistant", "content": "y" * 250},
+        {"role": "user", "content": "díky"},
+        {"role": "assistant", "content": "z" * 250},
+    ]
+    assert manager._compute_style_hint(msgs) == "KRATCE"
+
+
+def test_compute_style_hint_too_many_questions(manager):
+    """Detects when all recent responses end with questions."""
+    # Need short-enough responses to avoid triggering verbose/monotony first
+    msgs = [
+        {"role": "user", "content": "ahoj, jak se máš dneska celý den"},
+        {"role": "assistant", "content": "Čau, jak se máš?"},
+        {"role": "user", "content": "dobře, co ty dneska plánuješ dělat"},
+        {"role": "assistant", "content": "Super, co plánuješ?"},
+        {"role": "user", "content": "nic moc, uvidíme, možná půjdu ven"},
+        {"role": "assistant", "content": "Opravdu nic? Ani procházku?"},
+    ]
+    assert manager._compute_style_hint(msgs) == "BEZ_OTAZKY"
 
 
 def test_compute_style_hint_few_messages(manager):
@@ -257,27 +283,28 @@ def test_compute_style_hint_few_messages(manager):
     assert manager._compute_style_hint(msgs) is None
 
 
-def test_build_context_style_hint(manager):
+def test_build_context_style_hint_in_user_msg(manager):
+    """Style hint is appended to last user message, not as system message."""
     import config
     old = config.STYLE_VARIATION_ENABLED
     config.STYLE_VARIATION_ENABLED = True
-    # Need enough messages for style hint
     msgs = [
-        {"role": "user", "content": "a"},
-        {"role": "assistant", "content": "b"},
-        {"role": "user", "content": "c"},
-        {"role": "assistant", "content": "d"},
-        {"role": "user", "content": "e"},
-        {"role": "assistant", "content": "f"},
+        {"role": "user", "content": "ahoj"},
+        {"role": "assistant", "content": "x" * 250},
+        {"role": "user", "content": "ok"},
+        {"role": "assistant", "content": "y" * 250},
+        {"role": "user", "content": "díky"},
+        {"role": "assistant", "content": "z" * 250},
         {"role": "user", "content": "test"},
     ]
     context = manager.build_context(msgs)
-    style_msgs = [m for m in context
-                  if m["role"] == "system" and "<response_style_hint>" in m["content"]]
-    # Hint may or may not be generated depending on message lengths
-    # Just verify no crash and correct format if present
-    for m in style_msgs:
-        assert "</response_style_hint>" in m["content"]
+    # Should NOT be a system message
+    style_sys = [m for m in context
+                 if m["role"] == "system" and "<response_style_hint>" in m["content"]]
+    assert len(style_sys) == 0
+    # Should be appended to last user message
+    last_user = [m for m in context if m["role"] == "user"][-1]
+    assert "[Styl odpovědi:" in last_user["content"]
     config.STYLE_VARIATION_ENABLED = old
 
 
